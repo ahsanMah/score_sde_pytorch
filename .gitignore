@@ -1,5 +1,7 @@
 # Repo specific ignores
 workdir/
+.ipynb_checkpoints/
+.vscode/
 
 # Compiled python modules.
 *.pyc

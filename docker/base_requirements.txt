@@ -1,0 +1,11 @@
+jupyterlab
+seaborn
+pandas
+numba
+tqdm
+pyyaml
+scipy
+scikit-learn
+scipy
+scikit-image
+plotly
