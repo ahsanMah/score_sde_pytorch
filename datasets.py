@@ -16,11 +16,15 @@
 # pylint: skip-file
 """Return training and evaluation/test datasets from config files."""
 from tensorflow_datasets.core import dataset_info
+import os
 import jax
 import tensorflow as tf
 import numpy as np
 import tensorflow_datasets as tfds
 import tensorflow_addons as tfa
+
+from mri_utils import complex_magnitude
+from fastmri import FastKnee, FastKneeTumor
 
 
 def get_data_scaler(config):
@@ -98,6 +102,19 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
     shuffle_buffer_size = 10  # 10000
     prefetch_size = tf.data.experimental.AUTOTUNE
     num_epochs = None if not evaluation else 1
+
+    # TODO: Add appropriate OOD evaluation sets for other datasets
+    if ood_eval and config.data.dataset in [
+        "CIFAR10",
+        "SVHN",
+        "CELEBA",
+        "LSUN",
+        "FFHQ",
+        "CelebAHQ",
+    ]:
+        raise NotImplementedError(
+            f"OOD evaluation for dataset {config.data.dataset} not yet supported."
+        )
 
     # Create dataset builders for each dataset.
     if config.data.dataset == "CIFAR10":
@@ -185,7 +202,7 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
             img_sz = config.data.downsample_size
 
             # Random translate + rotate
-            translate_ratio = 0.5 * (crop_sz / img_sz)
+            translate_ratio = 0.55 * (crop_sz / img_sz)
             img = tfa.image.rotate(img, tf.random.uniform((1,), 0, np.pi / 2))
             img = tfa.image.translate(
                 img,
@@ -195,8 +212,8 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
             )
             img = tf.image.resize_with_crop_or_pad(img, crop_sz, crop_sz)
             img = tf.image.random_hue(img, max_delta=0.05)
-            img = tf.image.random_contrast(img, 0.8, 1.2)
-            img = tf.image.random_brightness(img, max_delta=0.2)
+            img = tf.image.random_contrast(img, 0.9, 1.1)
+            img = tf.image.random_brightness(img, max_delta=0.1)
             img = tf.image.random_flip_up_down(img)
 
             return img
@@ -207,43 +224,149 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
             train_split_name = "inlier"
             eval_split_name = "ood"
 
-    elif config.data.dataset == "knee":
-        dataset_dir = f"{config.data.dir_path}/{config.data.category}"
-        dataset_builder = tfds.ImageFolder(dataset_dir)
+    elif config.data.dataset == "KNEE":
+
+        rimg_h, rimg_w = config.data.downsample_size
 
         def resize_op(img):
             img = tf.image.convert_image_dtype(img, tf.float32)
-            img = tf.image.resize(
+            img = tf.image.resize_with_pad(
                 img,
-                [config.data.downsample_size, config.data.downsample_size],
+                rimg_h,
+                rimg_h,
                 antialias=True,
                 method=tf.image.ResizeMethod.LANCZOS5,
             )
-            img = (img - tf.reduce_min(img)) / (tf.reduce_max(img) - tf.reduce_min(img))
+
+            # img = img[15:-15, :]  # Crop high freqs to get square image
+
             return img
 
-        def augment_op(img):
+        if config.longleaf:
+            dataset_dir = f"{config.data.dir_path_longleaf}"
+        else:
+            dataset_dir = f"{config.data.dir_path}"
 
-            crop_sz = config.data.image_size
-            img_sz = config.data.downsample_size
+        max_marginal_ratio = config.data.marginal_ratio
+        mask_marginals = config.data.mask_marginals
+        category = config.data.category
+        complex_input = config.data.complex
 
-            # Random translate + rotate
-            translate_ratio = 0.5 * (crop_sz / img_sz)
-            img = tfa.image.rotate(img, tf.random.uniform((1,), 0, np.pi / 2))
-            img = tfa.image.translate(
+        train_dir = os.path.join(dataset_dir, "singlecoil_train/")
+        val_dir = os.path.join(dataset_dir, "singlecoil_val/")
+        test_dir = os.path.join(dataset_dir, "singlecoil_test_v2/")
+
+        img_h, img_w = config.data.original_dimensions
+        c = 2 if complex_input else 1
+
+        # if config.mask_marginals:
+        #     c += 1
+
+        def normalize(img, complex_input=False, quantile=0.999):
+
+            # Complex tensors are 2D
+            if complex_input:
+                h = np.quantile(img.reshape(-1, 2), q=quantile, axis=0)
+                # l = np.min(img.reshape(-1, 2), axis=0)
+                l = np.quantile(img.reshape(-1, 2), q=(1 - quantile) / 10, axis=0)
+            else:
+                h = np.quantile(img, q=quantile)
+                # l = np.min(img)
+                l = np.quantile(img, q=(1 - quantile) / 10)
+
+            # Min Max normalize
+            img = (img - l) / (h - l)
+            img = np.clip(
                 img,
-                tf.random.uniform(
-                    (1, 2), -translate_ratio * img_sz, translate_ratio * img_sz
-                ),
+                0.0,
+                1.0,
             )
-            img = tf.image.resize_with_crop_or_pad(img, crop_sz, crop_sz)
-            img = tf.image.random_hue(img, max_delta=0.05)
-            img = tf.image.random_contrast(img, 0.8, 1.2)
-            img = tf.image.random_brightness(img, max_delta=0.2)
-            img = tf.image.random_flip_up_down(img)
 
             return img
 
+        def make_generator(ds, ood=False):
+
+            if complex_input:
+                # Treat input as a 3D tensor (2 channels: real + imag)
+                preprocessor = lambda x: np.stack([x.real, x.imag], axis=-1)
+                normalizer = lambda x: normalize(x, complex_input=True)
+            else:
+                preprocessor = lambda x: complex_magnitude(x).numpy()[..., np.newaxis]
+                normalizer = lambda x: normalize(x)
+
+            label = 1 if ood else 0
+
+            # TODO: Build complex loader for img
+
+            def tf_gen_img():
+                for k, x in ds:
+                    img = preprocessor(x)
+                    img = normalizer(img)
+                    yield img
+
+            def tf_gen_ksp():
+                for k, x in ds:
+                    img = preprocessor(k)
+                    img = normalizer(img)
+                    yield img
+
+            if "kspace" == category:
+                print(
+                    f"Training on {'complex' if complex_input else 'image'} kspace..."
+                )
+                return tf_gen_ksp
+
+            # Default to target image as category
+            print(f"Training on {'complex' if complex_input else 'image'} mri...")
+            return tf_gen_img
+
+        def build_ds(datadir, ood=False):
+
+            output_type = tf.float32
+            output_shape = tf.TensorShape([img_h, img_w, c])
+
+            dataset = FastKnee(datadir) if not ood_eval else FastKneeTumor(datadir)
+            ds = tf.data.Dataset.from_generator(
+                make_generator(dataset, ood=ood),
+                output_type,
+                output_shape,
+                # output_signature=(tf.TensorSpec(shape=(img_h, img_w, c), dtype=tf.float32)),
+            )
+
+            return ds
+
+        def np_build_and_apply_random_mask(x):
+            # Building mask of random columns to **keep**
+            batch_sz, img_h, img_w, c = x.shape
+            rand_ratio = np.random.uniform(
+                low=config.data.min_marginal_ratio,
+                high=config.data.marginal_ratio,
+                size=1,
+            )
+            n_mask_cols = int(rand_ratio * img_w)
+            rand_cols = np.random.randint(img_w, size=n_mask_cols)
+
+            # We do *not* want to mask out the middle (low) frequencies
+            # Keeping 10% of low freq is equivalent to Scenario-30L in activemri paper
+            low_freq_cols = np.arange(int(0.45 * img_w), img_w - int(0.45 * img_w))
+            mask = np.zeros((batch_sz, img_h, img_w, 1), dtype=np.float32)
+            mask[:, :, rand_cols, :] = 1.0
+            mask[:, :, low_freq_cols, :] = 1.0
+
+            # Applying + Appending mask
+            x = x * mask
+            x = np.concatenate([x, mask], axis=-1)
+            return x
+
+        train_ds = build_ds(train_dir)
+        eval_ds = build_ds(val_dir)
+
+        # The datsets used to evaluate MSMA
+        if ood_eval:
+            train_ds = build_ds(test_dir)
+            eval_ds = build_ds(test_dir, ood=True)
+
+        dataset_builder = train_split_name = eval_split_name = None
     else:
         raise NotImplementedError(f"Dataset {config.data.dataset} not yet supported.")
 
@@ -274,6 +397,10 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
 
         def preprocess_fn(d):
             """Basic preprocessing function scales data to [0, 1) and randomly flips."""
+
+            if config.data.dataset in ["KNEE"]:
+                d = {"image": d}
+
             img = resize_op(d["image"])
             if config.data.random_flip and not evaluation:
                 img = tf.image.random_flip_left_right(img)
@@ -284,6 +411,9 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
 
             if config.data.dataset == "MVTEC" and not evaluation:
                 img = augment_op(img)
+
+            if config.data.dataset == "KNEE" and config.data.mask_marginals:
+                img = np_build_and_apply_random_mask(img)
 
             return dict(image=img, label=d.get("label", None))
 
@@ -300,8 +430,10 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
             ds = dataset_builder.as_dataset(
                 split=split, shuffle_files=evaluation, read_config=read_config
             )
-        else:
+        elif dataset_builder not in ["KNEE"]:
             ds = dataset_builder.with_options(dataset_options)
+        else:  # dataset_builder is already a TF Dataset
+            ds = dataset_builder
 
         if config.data.dataset == "MVTEC" and not ood_eval:
             val_size = int(0.1 * dataset_builder.info.splits["train"].num_examples)
@@ -317,17 +449,22 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
         ds = ds.batch(batch_size, drop_remainder=False)
         return ds.prefetch(prefetch_size)
 
-    train_ds = create_dataset(dataset_builder, train_split_name)
-    eval_ds = create_dataset(dataset_builder, eval_split_name, val=True)
+    if config.data.dataset in ["KNEE"]:
+        train_ds = create_dataset(train_ds, train_split_name)
+        eval_ds = create_dataset(eval_ds, eval_split_name)
+    else:
+        train_ds = create_dataset(dataset_builder, train_split_name)
+        eval_ds = create_dataset(dataset_builder, eval_split_name, val=True)
 
-    # Test if loader worked
+    #### Test if loader worked
     # import matplotlib.pyplot as plt
 
     # for x in train_ds:
     #     print("Shape:", x["image"].shape)
     #     print(x["image"].numpy().max())
-    #     plt.imshow(x["image"][0])
-    #     plt.savefig("mvtec_test.png")
+    #     q = np.quantile(x["image"].numpy(), 0.999)
+    #     plt.imshow(x["image"][0], vmax=q)
+    #     plt.savefig("knee_sq_crop.png")
     #     break
     # exit()
 
