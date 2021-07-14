@@ -300,18 +300,32 @@ def evaluate(config, workdir, eval_folder="eval"):
         )
 
     # Create data loaders for likelihood evaluation. Only evaluate on uniformly dequantized data
+
     train_ds_bpd, eval_ds_bpd, _ = datasets.get_dataset(
         config, uniform_dequantization=True, evaluation=True
     )
+
+    ds_mapper = {"test": eval_ds_bpd}
+
+    if config.eval.ood_eval:
+        # Create data loaders for ood evaluation. Only evaluate on uniformly dequantized data
+        inlier_ds_bpd, ood_ds_bpd, _ = datasets.get_dataset(
+            config, uniform_dequantization=True, evaluation=True, ood_eval=True
+        )
+        ds_mapper["inlier"] = inlier_ds_bpd
+        ds_mapper["ood"] = ood_ds_bpd
+
     if config.eval.bpd_dataset.lower() == "train":
         ds_bpd = train_ds_bpd
         bpd_num_repeats = 1
-    elif config.eval.bpd_dataset.lower() == "test":
+    elif config.eval.bpd_dataset.lower() in ds_mapper:
         # Go over the dataset 5 times when computing likelihood on the test dataset
-        ds_bpd = eval_ds_bpd
+        ds_bpd = ds_mapper[config.eval.bpd_dataset.lower()]
         bpd_num_repeats = 5
     else:
-        raise ValueError(f"No bpd dataset {config.eval.bpd_dataset} recognized.")
+        raise ValueError(
+            f"No bpd dataset {config.eval.bpd_dataset} recognized. `ood_eval` is set to  {config.eval.ood_eval}"
+        )
 
     # Build the likelihood computation function when likelihood is enabled
     if config.eval.enable_bpd:

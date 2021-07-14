@@ -28,14 +28,15 @@ def get_default_configs():
 
     # evaluation
     config.eval = evaluate = ml_collections.ConfigDict()
-    evaluate.begin_ckpt = 2
+    evaluate.begin_ckpt = 3
     evaluate.end_ckpt = 3
-    evaluate.batch_size = 32
+    evaluate.batch_size = 16
     evaluate.enable_sampling = False
     evaluate.num_samples = 50000
     evaluate.enable_loss = True
     evaluate.enable_bpd = True
-    evaluate.bpd_dataset = "test"
+    evaluate.bpd_dataset = "inlier"
+    evaluate.ood_eval = True
 
     # msma
     config.msma = msma = ml_collections.ConfigDict()
@@ -46,7 +47,7 @@ def get_default_configs():
     config.data = data = ml_collections.ConfigDict()
     data.dataset = "MVTEC"
     data.image_size = 128
-    data.downsample_size = 256
+    data.downsample_size = 200
     data.random_flip = True
     data.uniform_dequantization = False
     data.centered = False
