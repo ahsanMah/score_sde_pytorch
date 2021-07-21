@@ -55,8 +55,9 @@ def get_default_configs():
     data.dir_path = "/home/PO3D/raw_data/knee/"
     data.dir_path_longleaf = "/nas/longleaf/home/amahmood/mypine/DATA/knee"
 
-    data.mask_marginals = False
-    data.num_channels = 1
+    data.mask_marginals = True
+    data.num_channels = 2
+    data.shuffle_size = 1000
 
     # model
     config.model = model = ml_collections.ConfigDict()

@@ -36,16 +36,11 @@ def get_config():
     data = config.data
     data.centered = True
     data.category = "kspace"
+    data.marginal_ratio = data.min_marginal_ratio = 0.3
+
     data.complex = False
-    data.mask_marginals = False
-    data.marginal_ratio = 0.0
-    data.min_marginal_ratio = 0.0
-
     if data.complex:
-        data.num_channels = 2
-
-    if data.mask_marginals:
-        data.num_channels += 1
+        config.data.num_channels = 2
 
     # model
     model = config.model

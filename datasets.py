@@ -99,7 +99,7 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
         )
 
     # Reduce this when image resolution is too large and data pointer is stored
-    shuffle_buffer_size = 10  # 10000
+    shuffle_buffer_size = 100  # 10000
     prefetch_size = tf.data.experimental.AUTOTUNE
     num_epochs = None if not evaluation else 1
 
@@ -226,7 +226,7 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
 
     elif config.data.dataset == "KNEE":
 
-        rimg_h, rimg_w = config.data.downsample_size
+        rimg_h = rimg_w = config.data.downsample_size
 
         def resize_op(img):
             img = tf.image.convert_image_dtype(img, tf.float32)
@@ -335,36 +335,41 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
 
             return ds
 
+        channels = config.data.num_channels
+
         def np_build_and_apply_random_mask(x):
             # Building mask of random columns to **keep**
-            batch_sz, img_h, img_w, c = x.shape
+            # img_h, img_w, c = x.shape
+            bs = x.shape[0]
+
             rand_ratio = np.random.uniform(
                 low=config.data.min_marginal_ratio,
                 high=config.data.marginal_ratio,
                 size=1,
             )
-            n_mask_cols = int(rand_ratio * img_w)
-            rand_cols = np.random.randint(img_w, size=n_mask_cols)
+            n_mask_cols = int(rand_ratio * rimg_w)
+            rand_cols = np.random.randint(rimg_w, size=n_mask_cols)
 
             # We do *not* want to mask out the middle (low) frequencies
             # Keeping 10% of low freq is equivalent to Scenario-30L in activemri paper
-            low_freq_cols = np.arange(int(0.45 * img_w), img_w - int(0.45 * img_w))
-            mask = np.zeros((batch_sz, img_h, img_w, 1), dtype=np.float32)
-            mask[:, :, rand_cols, :] = 1.0
-            mask[:, :, low_freq_cols, :] = 1.0
+            low_freq_cols = np.arange(int(0.45 * rimg_w), img_w - int(0.45 * rimg_w))
+            mask = np.zeros((bs, rimg_h, rimg_w, 1), dtype=np.float32)
+            mask[..., rand_cols, :] = 1.0
+            mask[..., low_freq_cols, :] = 1.0
 
             # Applying + Appending mask
             x = x * mask
             x = np.concatenate([x, mask], axis=-1)
             return x
 
+        test_slices = 2000
         train_ds = build_ds(train_dir)
-        eval_ds = build_ds(val_dir)
+        eval_ds = build_ds(val_dir).skip(test_slices)
 
         # The datsets used to evaluate MSMA
         if ood_eval:
-            train_ds = build_ds(test_dir)
-            eval_ds = build_ds(test_dir, ood=True)
+            train_ds = build_ds(val_dir).take(test_slices)
+            eval_ds = build_ds(val_dir, ood=True).take(test_slices)
 
         dataset_builder = train_split_name = eval_split_name = None
     else:
@@ -412,8 +417,8 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
             if config.data.dataset == "MVTEC" and not evaluation:
                 img = augment_op(img)
 
-            if config.data.dataset == "KNEE" and config.data.mask_marginals:
-                img = np_build_and_apply_random_mask(img)
+            # if config.data.dataset == "KNEE" and config.data.mask_marginals:
+            #     img = np_build_and_apply_random_mask(img)
 
             return dict(image=img, label=d.get("label", None))
 
@@ -442,11 +447,25 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
             else:  # train split
                 ds = ds.skip(val_size)
 
+        ds = ds.cache()
         ds = ds.repeat(count=num_epochs)
         ds = ds.shuffle(shuffle_buffer_size)
         ds = ds.map(preprocess_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
-
         ds = ds.batch(batch_size, drop_remainder=False)
+
+        if config.data.dataset == "KNEE" and config.data.mask_marginals:
+            _fn = lambda x: tf.numpy_function(
+                func=np_build_and_apply_random_mask, inp=[x], Tout=tf.float32
+            )
+
+            def mask_fn(d):
+                x = d["image"]
+                l = d["label"]
+
+                return {"image": _fn(x), "label": l}
+
+            ds = ds.map(mask_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+
         return ds.prefetch(prefetch_size)
 
     if config.data.dataset in ["KNEE"]:
