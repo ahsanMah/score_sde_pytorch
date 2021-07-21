@@ -64,7 +64,13 @@ def optimization_manager(config):
 
 
 def get_sde_loss_fn(
-    sde, train, reduce_mean=True, continuous=True, likelihood_weighting=True, eps=1e-5
+    sde,
+    train,
+    reduce_mean=True,
+    continuous=True,
+    likelihood_weighting=True,
+    eps=1e-5,
+    masked_marginals=False,
 ):
     """Create a loss function for training with arbirary SDEs.
 
@@ -99,9 +105,23 @@ def get_sde_loss_fn(
         """
         score_fn = mutils.get_score_fn(sde, model, train=train, continuous=continuous)
         t = torch.rand(batch.shape[0], device=batch.device) * (sde.T - eps) + eps
-        z = torch.randn_like(batch)
-        mean, std = sde.marginal_prob(batch, t)
-        perturbed_data = mean + std[:, None, None, None] * z
+
+        # Use conditioning mask
+        if masked_marginals:
+            mask = batch[:, -1:, :, :]
+            batch = batch[:, :-1, :, :]
+            z = torch.randn_like(batch)
+            mean, std = sde.marginal_prob(batch, t)
+            # print(mean.shape, mask.shape)
+            perturbed_data = mean + std[:, None, None, None] * z
+            perturbed_data = perturbed_data * mask
+            perturbed_data = torch.cat((perturbed_data, mask), axis=1)
+            # print("mask pert", perturbed_data.shape)
+        else:
+            z = torch.randn_like(batch)
+            mean, std = sde.marginal_prob(batch, t)
+            perturbed_data = mean + std[:, None, None, None] * z
+
         score = score_fn(perturbed_data, t)
 
         if not likelihood_weighting:
@@ -182,6 +202,7 @@ def get_step_fn(
     reduce_mean=False,
     continuous=True,
     likelihood_weighting=False,
+    masked_marginals=False,
 ):
     """Create a one-step training/evaluation function.
 
@@ -203,6 +224,7 @@ def get_step_fn(
             reduce_mean=reduce_mean,
             continuous=True,
             likelihood_weighting=likelihood_weighting,
+            masked_marginals=masked_marginals,
         )
     else:
         assert (

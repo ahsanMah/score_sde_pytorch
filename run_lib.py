@@ -122,6 +122,8 @@ def train(config, workdir):
     continuous = config.training.continuous
     reduce_mean = config.training.reduce_mean
     likelihood_weighting = config.training.likelihood_weighting
+    masked_marginals = "mask_marginals" in config.data and config.data.mask_marginals
+
     train_step_fn = losses.get_step_fn(
         sde,
         train=True,
@@ -129,6 +131,7 @@ def train(config, workdir):
         reduce_mean=reduce_mean,
         continuous=continuous,
         likelihood_weighting=likelihood_weighting,
+        masked_marginals=masked_marginals,
     )
     eval_step_fn = losses.get_step_fn(
         sde,
@@ -137,6 +140,7 @@ def train(config, workdir):
         reduce_mean=reduce_mean,
         continuous=continuous,
         likelihood_weighting=likelihood_weighting,
+        masked_marginals=masked_marginals,
     )
 
     # Building sampling functions
@@ -612,7 +616,7 @@ def compute_scores(config, workdir, score_folder="scores"):
     )
 
     dataset_dict = {
-        "train": train_ds,
+        # "train": train_ds,
         "eval": eval_ds,
         "test": inlier_ds,
         "ood": ood_ds,
@@ -634,7 +638,7 @@ def compute_scores(config, workdir, score_folder="scores"):
             x_batch = scaler(x_batch)
             x_score = scorer(score_fn, x_batch)
             all_scores.append(x_score)
-            if (i + 1) % 2 == 0:
+            if (i + 1) % 200 == 0:
                 logging.info("Finished step %d for score evaluation" % (i + 1))
 
         all_scores = np.concatenate(all_scores, axis=1)
