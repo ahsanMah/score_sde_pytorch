@@ -17,6 +17,7 @@
 """Return training and evaluation/test datasets from config files."""
 from tensorflow_datasets.core import dataset_info
 import os
+import glob
 import jax
 import tensorflow as tf
 import numpy as np
@@ -25,6 +26,8 @@ import tensorflow_addons as tfa
 
 from mri_utils import complex_magnitude
 from fastmri import FastKnee, FastKneeTumor
+from monai.data import CacheDataset, DataLoader, ArrayDataset
+from monai.transforms import *
 
 
 def get_data_scaler(config):
@@ -179,6 +182,8 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
         dataset_dir = f"{config.data.dir_path}/{config.data.category}"
         dataset_builder = tfds.ImageFolder(dataset_dir)
 
+        # FIXME: this should be image size...
+        # e.g 1024 -> 200 - augment -> crop to 128
         img_sz = config.data.downsample_size
 
         # Downsample to image size directly as no cropping will be done
@@ -221,8 +226,8 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
         train_split_name = eval_split_name = "train"
 
         if ood_eval:
-            train_split_name = "inlier"
-            eval_split_name = "ood"
+            train_split_name = "train"
+            eval_split_name = "test"
 
     elif config.data.dataset == "KNEE":
 
@@ -276,11 +281,7 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
 
             # Min Max normalize
             img = (img - l) / (h - l)
-            img = np.clip(
-                img,
-                0.0,
-                1.0,
-            )
+            img = np.clip(img, 0.0, 1.0,)
 
             return img
 
@@ -372,6 +373,29 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
             eval_ds = build_ds(val_dir, ood=True).take(test_slices)
 
         dataset_builder = train_split_name = eval_split_name = None
+    elif config.data.dataset == "BRAIN":
+        dataset_dir = config.data.dir_path
+        val_file_list = [
+            {"image": x} for x in glob.glob(os.path.join(dataset_dir, "val/*"))
+        ]
+        train_file_list = [
+            {"image": x} for x in glob.glob(os.path.join(dataset_dir, "train/*"))
+        ]
+
+        img_transform = Compose(
+            [
+                LoadImaged("image", image_only=True),
+                SqueezeDimd("image", dim=3),
+                AsChannelFirstd("image"),
+                SpatialCropd("image", roi_start=[11, 9, 0], roi_end=[172, 205, 152]),
+                DivisiblePadd("image", k=8),
+                RandAdjustContrastd("image"),
+            ]
+        )
+
+        train_ds = ArrayDataset(train_file_list[:4], img_transform=img_transform)
+        eval_ds = ArrayDataset(val_file_list[:4], img_transform=img_transform)
+
     else:
         raise NotImplementedError(f"Dataset {config.data.dataset} not yet supported.")
 
@@ -468,6 +492,16 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
 
         return ds.prefetch(prefetch_size)
 
+    if config.data.dataset in ["BRAIN"]:
+        train_ds = DataLoader(
+            train_ds, batch_size=config.training.batch_size, shuffle=False
+        )
+        eval_ds = DataLoader(
+            eval_ds, batch_size=config.training.batch_size, shuffle=False
+        )
+
+        return train_ds, eval_ds, None
+
     if config.data.dataset in ["KNEE"]:
         train_ds = create_dataset(train_ds, train_split_name)
         eval_ds = create_dataset(eval_ds, eval_split_name)
@@ -483,7 +517,7 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
     #     print(x["image"].numpy().max())
     #     q = np.quantile(x["image"].numpy(), 0.999)
     #     plt.imshow(x["image"][0], vmax=q)
-    #     plt.savefig("knee_sq_crop.png")
+    #     plt.savefig(f"{config.data.dataset}.png")
     #     break
     # exit()
 

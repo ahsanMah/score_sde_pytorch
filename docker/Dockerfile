@@ -1,18 +1,24 @@
-FROM gcr.io/kaggle-gpu-images/python
+FROM nvcr.io/nvidia/pytorch:21.12-py3
 
 ENV JUPYTER_TOKEN="niral"
 ENV PASSWORD=niral
 
-RUN apt-get update --fix-missing
-# RUN apt-get install htop tmux screen -y
-# RUN curl -fsSL https://deb.nodesource.com/setup_lts.x -o nodesource_setup.sh
-# RUN bash nodesource_setup.sh && apt-get install -y nodejs
+ARG USER=docker
+ARG UID=1000
+ARG GID=1000
 
-COPY base_requirements.txt base_requirements.txt
-RUN /usr/bin/python3 -m pip install --upgrade pip
-RUN pip install -U -r base_requirements.txt
-RUN pip3 install torch==1.9.0+cu111 torchvision==0.10.0+cu111 torchaudio==0.9.0 -f https://download.pytorch.org/whl/torch_stable.html
+RUN useradd --system --create-home --home-dir /home/${USER} \
+    --shell /bin/bash --gid root -G sudo --uid ${UID} ${USER}
+RUN echo ${USER}:docker | chpasswd
+USER ${USER}
+WORKDIR /home/${USER}
+ENV PATH="${PATH}:/home/${USER}/.local/bin"
 
 # Repo requirements
-COPY repo_requirements.txt requirements.txt
-RUN pip install -r requirements.txt
+COPY repo_requirementsv2.txt requirements.txt
+RUN python -m pip install --user -r requirements.txt
+
+# RUN apt-get update --fix-missing
+# RUN apt install -y htop nodejs
+
+#TODO: Maybe add zsh ricing

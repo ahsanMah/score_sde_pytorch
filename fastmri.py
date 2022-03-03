@@ -24,7 +24,7 @@ import tensorflow as tf
 
 
 class FastKnee(Dataset):
-    def __init__(self, root):
+    def __init__(self, root, partial=False):
         super().__init__()
         self.examples = []
 

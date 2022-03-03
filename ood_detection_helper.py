@@ -157,17 +157,20 @@ def auxiliary_model_analysis(
     )
 
     print("=====" * 5 + " Training Flow Model " + "=====" * 5)
-    flow_model = train_flow(X_train, X_test, epochs=flow_epochs, verbose=verbose)
-    flow_train_score = flow_model.log_prob(X_train, dtype=np.float32).numpy()
-    flow_test_score = flow_model.log_prob(X_test, dtype=np.float32).numpy()
-    flow_ood_scores = np.array(
-        [flow_model.log_prob(ood, dtype=np.float32).numpy() for ood in outliers]
-    )
+    if flow_epochs > -1:
+        flow_model = train_flow(X_train, X_test, epochs=flow_epochs, verbose=verbose)
+        flow_train_score = flow_model.log_prob(X_train, dtype=np.float32).numpy()
+        flow_test_score = flow_model.log_prob(X_test, dtype=np.float32).numpy()
+        flow_ood_scores = np.array(
+            [flow_model.log_prob(ood, dtype=np.float32).numpy() for ood in outliers]
+        )
 
-    flow_metrics = get_metrics(-flow_test_score, -flow_ood_scores, labels)
-    flow_results = result_dict(
-        flow_train_score, flow_test_score, flow_ood_scores, flow_metrics
-    )
+        flow_metrics = get_metrics(-flow_test_score, -flow_ood_scores, labels)
+        flow_results = result_dict(
+            flow_train_score, flow_test_score, flow_ood_scores, flow_metrics
+        )
+    else:
+        flow_results=None
 
     print("=====" * 5 + " Training KD Tree " + "=====" * 5)
 

@@ -56,7 +56,9 @@ def get_default_configs():
     data.dir_path_longleaf = "/nas/longleaf/home/amahmood/mypine/DATA/knee"
 
     data.mask_marginals = True
-    data.num_channels = 2
+    data.num_channels = (
+        2  # This could be issue: Just use an init conv to read in masked image
+    )
     data.shuffle_size = 1000
 
     # model

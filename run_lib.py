@@ -27,7 +27,7 @@ import tensorflow_gan as tfgan
 import logging
 
 # Keep the import below for registering all model definitions
-from models import ddpm, ncsnv2, ncsnpp
+from models import ddpm, ncsnv2, ncsnpp, ncsnpp3d
 import losses
 import sampling
 from models import utils as mutils
@@ -44,6 +44,24 @@ from utils import save_checkpoint, restore_checkpoint
 from torchinfo import summary
 
 FLAGS = flags.FLAGS
+
+
+def inf_iter(data_loader):
+    """
+    Little Hack to reset iterator
+    """
+
+    data_iter = iter(data_loader)
+
+    while True:
+        try:
+            data = next(data_iter)
+        except StopIteration:
+            # StopIteration is thrown if dataset ends
+            # reinitialize data loader
+            data_iter = iter(data_loader)
+            data = next(data_iter)
+        yield data
 
 
 def train(config, workdir):
@@ -86,8 +104,8 @@ def train(config, workdir):
     train_ds, eval_ds, _ = datasets.get_dataset(
         config, uniform_dequantization=config.data.uniform_dequantization
     )
-    train_iter = iter(train_ds)  # pytype: disable=wrong-arg-types
-    eval_iter = iter(eval_ds)  # pytype: disable=wrong-arg-types
+    train_iter = inf_iter(train_ds)  # pytype: disable=wrong-arg-types
+    eval_iter = inf_iter(eval_ds)  # pytype: disable=wrong-arg-types
     # Create data normalizer and its inverse
     scaler = datasets.get_data_scaler(config)
     inverse_scaler = datasets.get_data_inverse_scaler(config)
@@ -162,13 +180,17 @@ def train(config, workdir):
 
     for step in range(initial_step, num_train_steps + 1):
         # Convert data to JAX arrays and normalize them. Use ._numpy() to avoid copy.
-        batch = (
-            torch.from_numpy(next(train_iter)["image"]._numpy())
-            .to(config.device)
-            .float()
-        )
-        batch = batch.permute(0, 3, 1, 2)
-        batch = scaler(batch)
+        if not isinstance(train_ds, torch.utils.data.DataLoader):
+            batch = (
+                torch.from_numpy(next(train_iter)["image"]._numpy())
+                .to(config.device)
+                .float()
+            )
+            batch = batch.permute(0, 3, 1, 2)
+            batch = scaler(batch)
+        else:
+            batch = next(train_iter)
+
         # Execute one training step
         loss = train_step_fn(state, batch)
         if step % config.training.log_freq == 0:
@@ -181,6 +203,7 @@ def train(config, workdir):
 
         # Report the loss on an evaluation dataset periodically
         if step % config.training.eval_freq == 0:
+            # FIXME: Add check for torch
             eval_batch = (
                 torch.from_numpy(next(eval_iter)["image"]._numpy())
                 .to(config.device)
@@ -378,7 +401,7 @@ def evaluate(config, workdir, eval_folder="eval"):
         # Compute the loss function on the full evaluation dataset if loss computation is enabled
         if config.eval.enable_loss:
             all_losses = []
-            eval_iter = iter(eval_ds)  # pytype: disable=wrong-arg-types
+            eval_iter = inf_iter(eval_ds)  # pytype: disable=wrong-arg-types
             for i, batch in enumerate(eval_iter):
                 eval_batch = (
                     torch.from_numpy(batch["image"]._numpy()).to(config.device).float()
@@ -405,7 +428,7 @@ def evaluate(config, workdir, eval_folder="eval"):
         if config.eval.enable_bpd:
             bpds = []
             for repeat in range(bpd_num_repeats):
-                bpd_iter = iter(ds_bpd)  # pytype: disable=wrong-arg-types
+                bpd_iter = inf_iter(ds_bpd)  # pytype: disable=wrong-arg-types
                 for batch_id in range(len(ds_bpd)):
                     batch = next(bpd_iter)
                     eval_batch = (
@@ -538,27 +561,15 @@ def compute_scores(config, workdir, score_folder="scores"):
     n_timesteps = config.msma.n_timesteps
     eps = config.msma.min_timestep
 
-    def scorer(score_fn, x):
-        scores = np.zeros((n_timesteps, *x.shape))
-        with torch.no_grad():
-            timesteps = torch.linspace(sde.T, eps, n_timesteps, device=config.device)
-            for i in range(n_timesteps):
-                t = timesteps[i]
-                vec_t = torch.ones(x.shape[0], device=config.device) * t
-                std = sde.marginal_prob(torch.zeros_like(x), vec_t)[1] ** 2
-                score = score_fn(x, vec_t) * std[:, None, None, None]
-                scores[i, ...] = score.cpu().numpy()
-        return scores
-
     score_dir = os.path.join(workdir, score_folder)
     tf.io.gfile.makedirs(score_dir)
 
     # Build data pipeline
-    train_ds, eval_ds, _ = datasets.get_dataset(
-        config,
-        uniform_dequantization=config.data.uniform_dequantization,
-        evaluation=True,
-    )
+    # train_ds, eval_ds, _ = datasets.get_dataset(
+    #     config,
+    #     uniform_dequantization=config.data.uniform_dequantization,
+    #     evaluation=True,
+    # )
 
     inlier_ds, ood_ds, _ = datasets.get_dataset(
         config,
@@ -596,6 +607,21 @@ def compute_scores(config, workdir, score_folder="scores"):
     else:
         raise NotImplementedError(f"SDE {config.training.sde} unknown.")
 
+    eps = 1e-3
+    msma_sigmas = torch.linspace(eps, 1.0, n_timesteps, device="cuda")
+    timesteps = sde.noise_schedule_inverse(msma_sigmas)
+
+    def scorer(score_fn, x):
+        scores = np.zeros((n_timesteps, *x.shape))
+        with torch.no_grad():
+            for i in range(n_timesteps):
+                t = timesteps[i]
+                vec_t = torch.ones(x.shape[0], device=config.device) * t
+                std = sde.marginal_prob(torch.zeros_like(x), vec_t)[1]
+                score = score_fn(x, vec_t) * std[:, None, None, None]
+                scores[i, ...] = score.cpu().numpy()
+        return scores
+
     # Initialize model
     score_model = mutils.create_model(config)
     optimizer = losses.get_optimizer(config, score_model.parameters())
@@ -616,10 +642,10 @@ def compute_scores(config, workdir, score_folder="scores"):
     )
 
     dataset_dict = {
-        # "train": train_ds,
-        "eval": eval_ds,
-        "test": inlier_ds,
-        "ood": ood_ds,
+        "train": inlier_ds,
+        # "eval": eval_ds,
+        "test": ood_ds,
+        # "ood": ood_ds,
     }
     score_dict = {}
     score_norm_dict = {}
@@ -627,8 +653,8 @@ def compute_scores(config, workdir, score_folder="scores"):
     for name, ds in dataset_dict.items():
         logging.info(f"Computing scores for {name} set")
 
-        all_scores = []
-        score_norms = None
+        all_scores = None
+        score_norms = []
 
         for i, batch in enumerate(ds):
             x_batch = (
@@ -637,14 +663,20 @@ def compute_scores(config, workdir, score_folder="scores"):
             x_batch = x_batch.permute(0, 3, 1, 2)
             x_batch = scaler(x_batch)
             x_score = scorer(score_fn, x_batch)
-            all_scores.append(x_score)
-            if (i + 1) % 200 == 0:
+
+            if all_scores is None:
+                all_scores = [x_score[:, :10, ...]]
+
+            x_score_norm = np.linalg.norm(
+                x_score.reshape((x_score.shape[0], x_score.shape[1], -1)), axis=-1
+            )
+            score_norms.append(x_score_norm)
+
+            if (i + 1) % 2 == 0:
                 logging.info("Finished step %d for score evaluation" % (i + 1))
 
         all_scores = np.concatenate(all_scores, axis=1)
-        score_norms = np.linalg.norm(
-            all_scores.reshape((all_scores.shape[0], all_scores.shape[1], -1)), axis=-1
-        )
+        score_norms = np.concatenate(score_norms, axis=1)
         score_dict[name] = all_scores
         score_norm_dict[name] = score_norms
 
