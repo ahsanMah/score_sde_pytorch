@@ -1,4 +1,8 @@
 # Repo specific ignores
+.png
+.jpg
+.ipynb
+docker/
 workdir/
 .ipynb_checkpoints/
 .vscode/
