@@ -24,6 +24,9 @@ from ml_collections.config_flags import config_flags
 import logging
 import os
 import tensorflow as tf
+import warnings
+
+warnings.filterwarnings("ignore")
 
 gpus = tf.config.list_physical_devices("GPU")
 if gpus:

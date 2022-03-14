@@ -170,7 +170,11 @@ def train(config, workdir):
             config.data.image_size,
         )
         sampling_fn = sampling.get_sampling_fn(
-            config, sde, sampling_shape, inverse_scaler, sampling_eps
+            config,
+            sde,
+            sampling_shape,
+            inverse_scaler,
+            sampling_eps,
         )
 
     num_train_steps = config.training.n_iters
@@ -187,10 +191,11 @@ def train(config, workdir):
                 .float()
             )
             batch = batch.permute(0, 3, 1, 2)
-            batch = scaler(batch)
         else:
-            batch = next(train_iter)
+            batch = next(train_iter)["image"].to(config.device).float()
 
+        batch = scaler(batch)
+        # print("Train shape:", batch.shape)
         # Execute one training step
         loss = train_step_fn(state, batch)
         if step % config.training.log_freq == 0:
@@ -203,13 +208,16 @@ def train(config, workdir):
 
         # Report the loss on an evaluation dataset periodically
         if step % config.training.eval_freq == 0:
-            # FIXME: Add check for torch
-            eval_batch = (
-                torch.from_numpy(next(eval_iter)["image"]._numpy())
-                .to(config.device)
-                .float()
-            )
-            eval_batch = eval_batch.permute(0, 3, 1, 2)
+            if not isinstance(train_ds, torch.utils.data.DataLoader):
+                eval_batch = (
+                    torch.from_numpy(next(eval_iter)["image"]._numpy())
+                    .to(config.device)
+                    .float()
+                )
+                eval_batch = eval_batch.permute(0, 3, 1, 2)
+            else:
+                eval_batch = next(eval_iter)["image"].to(config.device).float()
+
             eval_batch = scaler(eval_batch)
             eval_loss = eval_step_fn(state, eval_batch)
             logging.info("step: %d, eval_loss: %.5e" % (step, eval_loss.item()))
@@ -558,9 +566,6 @@ def evaluate(config, workdir, eval_folder="eval"):
 
 
 def compute_scores(config, workdir, score_folder="scores"):
-    n_timesteps = config.msma.n_timesteps
-    eps = config.msma.min_timestep
-
     score_dir = os.path.join(workdir, score_folder)
     tf.io.gfile.makedirs(score_dir)
 
@@ -607,12 +612,20 @@ def compute_scores(config, workdir, score_folder="scores"):
     else:
         raise NotImplementedError(f"SDE {config.training.sde} unknown.")
 
-    eps = 1e-3
+    eps = config.msma.min_sigma
+    n_timesteps = config.msma.n_timesteps
     msma_sigmas = torch.linspace(eps, 1.0, n_timesteps, device="cuda")
     timesteps = sde.noise_schedule_inverse(msma_sigmas)
 
+    img_sz = config.data.image_size
+    channels = config.data.num_channels
+
+    if config.data.mask_marginals:
+        channels -= 1
+
     def scorer(score_fn, x):
-        scores = np.zeros((n_timesteps, *x.shape))
+        # scores = np.zeros((n_timesteps, *x.shape))
+        scores = np.zeros((n_timesteps, x.shape[0], channels, img_sz, img_sz))
         with torch.no_grad():
             for i in range(n_timesteps):
                 t = timesteps[i]
@@ -622,24 +635,34 @@ def compute_scores(config, workdir, score_folder="scores"):
                 scores[i, ...] = score.cpu().numpy()
         return scores
 
-    # Initialize model
-    score_model = mutils.create_model(config)
-    optimizer = losses.get_optimizer(config, score_model.parameters())
-    ema = ExponentialMovingAverage(
-        score_model.parameters(), decay=config.model.ema_rate
-    )
-    state = dict(optimizer=optimizer, model=score_model, ema=ema, step=0)
+    # Initialize model\
+    with torch.no_grad():
+        score_model = mutils.create_model(config)
+        optimizer = losses.get_optimizer(config, score_model.parameters())
+        ema = ExponentialMovingAverage(
+            score_model.parameters(), decay=config.model.ema_rate
+        )
+        state = dict(optimizer=optimizer, model=score_model, ema=ema, step=0)
 
-    # Loading latest intermediate checkpoint
-    checkpoint_meta_dir = os.path.join(workdir, "checkpoints-meta", "checkpoint.pth")
-    state = restore_checkpoint(checkpoint_meta_dir, state, config.device)
-    ema = state["ema"]
-    # ema.store(score_model.parameters())
-    ema.copy_to(score_model.parameters())
+        # Loading latest intermediate checkpoint
+        ckpt = config.msma.checkpoint
+        if ckpt == -1:  # latest-checkpoint
+            checkpoint_dir = os.path.join(workdir, "checkpoints-meta", "checkpoint.pth")
+        else:
+            checkpoint_dir = os.path.join(
+                workdir, "checkpoints", f"checkpoint_{ckpt}.pth"
+            )
 
-    score_fn = mutils.get_score_fn(
-        sde, score_model, train=False, continuous=config.training.continuous
-    )
+        state = restore_checkpoint(checkpoint_dir, state, config.device)
+        ema = state["ema"]
+        ema.copy_to(score_model.parameters())
+        score_fn = mutils.get_score_fn(
+            sde, score_model, train=False, continuous=config.training.continuous
+        )
+        ckpt = state["step"]
+        logging.info(f"Loaded checkpoint {ckpt}")
+
+        del state
 
     dataset_dict = {
         "train": inlier_ds,
@@ -665,7 +688,7 @@ def compute_scores(config, workdir, score_folder="scores"):
             x_score = scorer(score_fn, x_batch)
 
             if all_scores is None:
-                all_scores = [x_score[:, :10, ...]]
+                all_scores = [x_score[::10, ::8, ...]]
 
             x_score_norm = np.linalg.norm(
                 x_score.reshape((x_score.shape[0], x_score.shape[1], -1)), axis=-1
@@ -681,7 +704,7 @@ def compute_scores(config, workdir, score_folder="scores"):
         score_norm_dict[name] = score_norms
 
     # Save loss values to disk or Google Cloud Storage
-    ckpt = "latest"
+    # ckpt = "latest"
     # TODO: Save norms in different file
     with tf.io.gfile.GFile(
         os.path.join(score_dir, f"ckpt_{ckpt}_scores.npz"), "wb"

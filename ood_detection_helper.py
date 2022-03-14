@@ -156,8 +156,8 @@ def auxiliary_model_analysis(
         gmm_train_score, gmm_test_score, gmm_ood_scores, gmm_metrics
     )
 
-    print("=====" * 5 + " Training Flow Model " + "=====" * 5)
     if flow_epochs > -1:
+        print("=====" * 5 + " Training Flow Model " + "=====" * 5)
         flow_model = train_flow(X_train, X_test, epochs=flow_epochs, verbose=verbose)
         flow_train_score = flow_model.log_prob(X_train, dtype=np.float32).numpy()
         flow_test_score = flow_model.log_prob(X_test, dtype=np.float32).numpy()
@@ -359,7 +359,7 @@ def plot_curves(inlier_score, outlier_score, label, axs=()):
     y_scores = np.concatenate((inlier_score, outlier_score))
 
     fpr, tpr, thresholds = roc_curve(y_true, y_scores, drop_intermediate=True)
-    roc_auc = roc_auc = roc_auc_score(y_true, y_scores)
+    roc_auc = roc_auc_score(y_true, y_scores)
 
     prec_in, rec_in, _ = precision_recall_curve(y_true, y_scores)
     prec_out, rec_out, _ = precision_recall_curve((y_true == 0), -y_scores)
