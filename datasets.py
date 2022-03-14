@@ -26,8 +26,105 @@ import tensorflow_addons as tfa
 
 from mri_utils import complex_magnitude
 from fastmri import FastKnee, FastKneeTumor
-from monai.data import CacheDataset, DataLoader, ArrayDataset
+from monai.data import CacheDataset, DataLoader, ArrayDataset, PersistentDataset
 from monai.transforms import *
+from PIL import Image
+
+class RandomPattern:
+    """
+    Reproduces "random pattern mask" for inpainting, which was proposed in
+    Pathak, D., Krahenbuhl, P., Donahue, J., Darrell, T.,
+    & Efros, A. A. Context Encoders: Feature Learning by Inpainting.
+    Conference on Computer Vision and Pattern Recognition, 2016.
+    ArXiv link: https://arxiv.org/abs/1604.07379
+    This code is based on lines 273-283 and 316-330 of Context Encoders
+    implementation:
+    https://github.com/pathak22/context-encoder/blob/master/train_random.lua
+    The idea is to generate small matrix with uniform random elements,
+    then resize it using bicubic interpolation into a larger matrix,
+    then binarize it with some threshold,
+    and then crop a rectangle from random position and return it as a mask.
+    If the rectangle contains too many or too few ones, the position of
+    the rectangle is generated again.
+    The big matrix is resampled when the total number of elements in
+    the returned masks times update_freq is more than the number of elements
+    in the big mask. This is done in order to find balance between generating
+    the big matrix for each mask (which is involves a lot of unnecessary
+    computations) and generating one big matrix at the start of the training
+    process and then sampling masks from it only (which may lead to
+    overfitting to the specific patterns).
+    """
+
+    def __init__(
+        self, max_size=10000, resolution=0.06, density=0.25, update_freq=1, seed=239
+    ):
+        """
+        Args:
+            max_size (int):      the size of big binary matrix
+            resolution (float):  the ratio of the small matrix size to
+                                 the big one. Authors recommend to use values
+                                 from 0.01 to 0.1.
+            density (float):     the binarization threshold, also equals
+                                 the average ones ratio in the mask
+            update_freq (float): the frequency of the big matrix resampling
+            seed (int):          random seed
+        """
+        self.max_size = max_size
+        self.resolution = resolution
+        self.density = density
+        self.update_freq = update_freq
+        self.rng = np.random.RandomState(seed)
+        self.regenerate_cache()
+
+    def regenerate_cache(self):
+        """
+        Resamples the big matrix and resets the counter of the total
+        number of elements in the returned masks.
+        """
+        low_size = int(self.resolution * self.max_size)
+        low_pattern = self.rng.uniform(0, 1, size=(low_size, low_size))
+        low_pattern = low_pattern.astype("float32")
+        pattern = Image.fromarray(low_pattern)
+        pattern = pattern.resize((self.max_size, self.max_size), Image.BICUBIC)
+        pattern = np.array(pattern)
+        pattern = (pattern < self.density).astype("float32")
+        self.pattern = pattern
+        self.points_used = 0
+
+    def __call__(self, image, density_std=0.05):
+        """
+        Image is supposed to have shape [H, W, C].
+        Return binary mask of the same shape, where for each object
+        the ratio of ones in the mask is in the open interval
+        (self.density - density_std, self.density + density_std).
+        The less is density_std, the longer is mask generation time.
+        For very small density_std it may be even infinity, because
+        there is no rectangle in the big matrix which fulfills
+        the requirements.
+        """
+        height, width, num_channels = image.shape
+        x = self.rng.randint(0, self.max_size - width + 1)
+        y = self.rng.randint(0, self.max_size - height + 1)
+        res = self.pattern[y : y + height, x : x + width]
+        coverage = res.mean()
+        while not (self.density - density_std < coverage < self.density + density_std):
+            x = self.rng.randint(0, self.max_size - width + 1)
+            y = self.rng.randint(0, self.max_size - height + 1)
+            res = self.pattern[y : y + height, x : x + width]
+            coverage = res.mean()
+        mask = np.tile(res[:, :, None], [1, 1, num_channels])
+        mask = 1.0 - mask
+        self.points_used += width * height
+        if self.update_freq * (self.max_size ** 2) < self.points_used:
+            self.regenerate_cache()
+        return mask.astype("uint8")
+
+def get_channel_selector(config):
+    c = config.data.select_channel
+    if c > -1:
+        return lambda x: np.expand_dims(x[c, ...], axis=0)
+    else:
+        return lambda x: x
 
 
 def get_data_scaler(config):
@@ -181,8 +278,9 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
     elif config.data.dataset == "MVTEC":
         dataset_dir = f"{config.data.dir_path}/{config.data.category}"
         dataset_builder = tfds.ImageFolder(dataset_dir)
+        
 
-        # FIXME: this should be image size...
+        # This is image size BEFORE translate + crop
         # e.g 1024 -> 200 - augment -> crop to 128
         img_sz = config.data.downsample_size
 
@@ -207,7 +305,7 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
             img_sz = config.data.downsample_size
 
             # Random translate + rotate
-            translate_ratio = 0.55 * (crop_sz / img_sz)
+            translate_ratio = 0.33 * (crop_sz / img_sz)
             img = tfa.image.rotate(img, tf.random.uniform((1,), 0, np.pi / 2))
             img = tfa.image.translate(
                 img,
@@ -216,10 +314,32 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
                 ),
             )
             img = tf.image.resize_with_crop_or_pad(img, crop_sz, crop_sz)
-            img = tf.image.random_hue(img, max_delta=0.05)
             img = tf.image.random_contrast(img, 0.9, 1.1)
-            img = tf.image.random_brightness(img, max_delta=0.1)
+            img = tf.image.random_brightness(img, max_delta=0.05)
+            img = tf.image.random_hue(img, max_delta=0.05)
             img = tf.image.random_flip_up_down(img)
+
+            return img
+        
+        tmp = tf.zeros((config.data.image_size, config.data.image_size, 1))
+        mask_generator = RandomPattern()
+        
+        def mask_op(img):
+            
+            if evaluation:
+                mask = tf.ones_like(tmp)
+                img = tf.concat([img, mask], axis=-1)
+                return img
+
+            if np.random.uniform([1]) < 0.5:
+                mask = tf.ones_like(img)
+            else:
+                mask = tf.cast(mask_generator(tmp), dtype=tf.float32)
+                # mask = tf.expand_dims(mask, axis=0)
+
+            # mask = tf.repeat(mask, repeats=img.shape[0], axis=0)
+            img = img * mask
+            img = tf.concat([img, mask], axis=-1)
 
             return img
 
@@ -373,28 +493,215 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
             eval_ds = build_ds(val_dir, ood=True).take(test_slices)
 
         dataset_builder = train_split_name = eval_split_name = None
+    
     elif config.data.dataset == "BRAIN":
         dataset_dir = config.data.dir_path
+        splits_dir = config.data.splits_path
+
+        clean = lambda x: x.strip().replace("_", "")
+        # print("Dir for keys:", splits_dir)
+        filenames = {}
+        for split in ["train", "val", "test", "ood"]:
+            with open(os.path.join(splits_dir, f"{split}_keys.txt"), "r") as f:
+                filenames[split] = [clean(x) for x in f.readlines()]
+
         val_file_list = [
-            {"image": x} for x in glob.glob(os.path.join(dataset_dir, "val/*"))
-        ]
-        train_file_list = [
-            {"image": x} for x in glob.glob(os.path.join(dataset_dir, "train/*"))
+            {"image": os.path.join(dataset_dir, f"{x}.nii.gz")}
+            for x in filenames["val"]
         ]
 
-        img_transform = Compose(
+        train_file_list = [
+            {"image": os.path.join(dataset_dir, f"{x}.nii.gz")}
+            for x in filenames["train"]
+        ]
+
+        test_file_list = [
+            {"image": os.path.join(dataset_dir, f"{x}.nii.gz")}
+            for x in filenames["test"]
+        ]
+
+        ood_file_list = [
+            {"image": os.path.join(dataset_dir, f"{x}.nii.gz")}
+            for x in filenames["ood"]
+        ]
+
+        img_sz = config.data.image_size
+        cache = config.data.cache_rate
+        channel_selector = get_channel_selector(config)
+        cache_dir_name = "/tmp/monai_brains_nopad/train"
+
+        def fetch_mid_axial_slices(x, val=False):
+            if evaluation:
+                fetched_slice = x.shape[3]//2
+            else:
+                fetched_slice = np.random.randint(x.shape[3]//2-5, x.shape[3]//2+5)
+            
+            return channel_selector(x[:, :, fetched_slice, :])
+    
+
+        train_transform = Compose(
             [
                 LoadImaged("image", image_only=True),
                 SqueezeDimd("image", dim=3),
                 AsChannelFirstd("image"),
                 SpatialCropd("image", roi_start=[11, 9, 0], roi_end=[172, 205, 152]),
-                DivisiblePadd("image", k=8),
-                RandAdjustContrastd("image"),
+                RandStdShiftIntensityd("image", (-0.1, 0.1)),
+                # RandScaleIntensityd("image", (0.9, 1.1)),
+                RandScaleIntensityd("image", (-0.1, 0.1)),
+                RandHistogramShiftd("image", num_control_points=[3, 5]),
+                RandFlipd("image", prob=0.5, spatial_axis=0),
+                RandAffined(
+                    "image",
+                    prob=0.1,
+                    rotate_range=[0.03, 0.03, 0.03],
+                    translate_range=3,
+                ),
+                RandLambdad("image", func = fetch_mid_axial_slices),
+                # RandLambdad("image", func = resize_op),
+                ToTensord("image"),
+                TorchVisiond("image", "Resize", size=(img_sz, img_sz), antialias=True),
+                ScaleIntensityd("image", minv=0, maxv=1.0)
             ]
         )
 
-        train_ds = ArrayDataset(train_file_list[:4], img_transform=img_transform)
-        eval_ds = ArrayDataset(val_file_list[:4], img_transform=img_transform)
+        val_transform = Compose(
+            [
+                LoadImaged("image", image_only=True),
+                SqueezeDimd("image", dim=3),
+                AsChannelFirstd("image"),
+                SpatialCropd("image", roi_start=[11, 9, 0], roi_end=[172, 205, 152]),
+                RandLambdad("image", func = fetch_mid_axial_slices),
+                ToTensord("image"),
+                TorchVisiond("image", "Resize", size=(img_sz, img_sz), antialias=True),
+                ScaleIntensityd("image", minv=0, maxv=1.0)
+            ]
+        )
+
+        # train_ds = ArrayDataset(
+        #     train_file_list, img_transform=train_transform
+        # )
+
+        train_ds = PersistentDataset(
+                train_file_list, transform=train_transform,
+                cache_dir=cache_dir_name,
+            )
+
+        eval_ds = CacheDataset(
+            val_file_list, transform=val_transform,
+            cache_rate=cache,num_workers=4
+         )
+
+        # if not evaluation:
+        #     train_ds = PersistentDataset(
+        #         train_file_list, transform=train_transform, cache_dir=cache_dir_name,
+        #     )
+
+        #     eval_ds = CacheDataset(
+        #         val_file_list,
+        #         transform=val_transform,
+        #         cache_rate=CACHE_RATE,
+        #         num_workers=4,
+        #     )
+
+        # elif not ood_eval:
+        #     train_ds = CacheDataset(
+        #         train_file_list,
+        #         transform=val_transform,
+        #         cache_rate=CACHE_RATE,
+        #         num_workers=4,
+        #     )
+
+        #     eval_ds = CacheDataset(
+        #         val_file_list,
+        #         transform=val_transform,
+        #         cache_rate=CACHE_RATE,
+        #         num_workers=4,
+        #     )
+
+        # else:  # evaluation AND ood_eval
+        #     train_ds = None
+        #     inlier_file_list = test_file_list
+        #     img_transform = val_transform
+
+        #     # Generate OOD samples by adding "tumors" to center
+        #     # i.e. compute random grid deformations
+        #     if config.data.gen_ood:
+        #         deformer = RandTumor(
+        #             spacing=1.0,
+        #             max_tumor_size=5.0 / config.data.spacing_pix_dim,
+        #             magnitude_range=(
+        #                 5.0 / config.data.spacing_pix_dim,
+        #                 15.0 / config.data.spacing_pix_dim,
+        #             ),
+        #             prob=1.0,
+        #             spatial_size=config.data.image_size,  # [168, 200, 152],
+        #             padding_mode="zeros",
+        #         )
+
+        #         deformer.set_random_state(seed=0)
+
+        #         ood_transform = Compose(
+        #             [
+        #                 LoadImaged("image", image_only=True),
+        #                 SqueezeDimd("image", dim=3),
+        #                 AsChannelFirstd("image"),
+        #                 SpatialCropd(
+        #                     "image", roi_start=[11, 9, 0], roi_end=[172, 205, 152]
+        #                 ),
+        #                 Spacingd("image", pixdim=spacing),
+        #                 DivisiblePadd("image", k=8),
+        #                 RandLambdad("image", deformer),
+        #             ]
+        #         )
+
+        #         ood_file_list = test_file_list
+        #         img_transform = ood_transform
+
+        #     elif config.data.ood_ds == "IBIS":
+        #         filenames = {}
+        #         for split in ["ibis_inlier", "ibis_outlier"]:
+        #             with open(os.path.join(splits_dir, f"{split}_keys.txt"), "r") as f:
+        #                 filenames[split] = [x.strip() for x in f.readlines()]
+
+        #         inlier_file_list = [
+        #             {"image": os.path.join(dataset_dir, "ibis", f"{x}.nii.gz")}
+        #             for x in filenames["ibis_inlier"]
+        #         ]
+
+        #         ood_file_list = [
+        #             {"image": os.path.join(dataset_dir, "ibis", f"{x}.nii.gz")}
+        #             for x in filenames["ibis_outlier"]
+        #         ]
+
+        #     elif "LESION" in config.data.ood_ds:
+        #         suffix = ""
+        #         if "-" in config.data.ood_ds:
+        #             _, suffix = config.data.ood_ds.split("-")
+        #             suffix = "-" + suffix
+
+        #         dirname = "lesion" + suffix
+
+        #         ood_file_list = [
+        #             {"image": x}
+        #             for x in glob.glob(os.path.join(dataset_dir, "..", dirname, "*"))
+        #         ]
+        #         print("Collected samples:", len(ood_file_list), "from", dirname)
+
+        #     # Load either real or generated ood samples
+        #     # Defaults to ABCD test/ood data
+        #     train_ds = CacheDataset(
+        #         inlier_file_list,
+        #         transform=val_transform,
+        #         cache_rate=CACHE_RATE * 0,
+        #         num_workers=4,
+        #     )
+
+        #     eval_ds = CacheDataset(
+        #         ood_file_list,
+        #         transform=img_transform,
+        #         cache_rate=CACHE_RATE * 0,
+        #         num_workers=4,
+        #     )
 
     else:
         raise NotImplementedError(f"Dataset {config.data.dataset} not yet supported.")
@@ -438,8 +745,13 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
                     tf.random.uniform(img.shape, dtype=tf.float32) + img * 255.0
                 ) / 256.0
 
-            if config.data.dataset == "MVTEC" and not evaluation:
-                img = augment_op(img)
+            if config.data.dataset == "MVTEC":
+
+                if not evaluation and config.training.rand_augment:
+                    img = augment_op(img)
+                
+                if config.data.mask_marginals:
+                    img = mask_op(img)
 
             # if config.data.dataset == "KNEE" and config.data.mask_marginals:
             #     img = np_build_and_apply_random_mask(img)
@@ -493,30 +805,52 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
         return ds.prefetch(prefetch_size)
 
     if config.data.dataset in ["BRAIN"]:
+        from monai.data import DataLoader
+
         train_ds = DataLoader(
-            train_ds, batch_size=config.training.batch_size, shuffle=False
+            train_ds, batch_size=config.training.batch_size, shuffle=True,
+            num_workers=6
         )
         eval_ds = DataLoader(
-            eval_ds, batch_size=config.training.batch_size, shuffle=False
+            eval_ds, batch_size=config.eval.batch_size, shuffle=False,
+            num_workers=2
         )
 
-        return train_ds, eval_ds, None
+        dataset_builder = None
+        # return train_ds, eval_ds, None
 
-    if config.data.dataset in ["KNEE"]:
+    elif config.data.dataset in ["KNEE"]:
         train_ds = create_dataset(train_ds, train_split_name)
         eval_ds = create_dataset(eval_ds, eval_split_name)
     else:
         train_ds = create_dataset(dataset_builder, train_split_name)
         eval_ds = create_dataset(dataset_builder, eval_split_name, val=True)
 
-    #### Test if loader worked
+    # #### Test if loader worked
     # import matplotlib.pyplot as plt
-
+    # import torchvision.transforms.functional as F
+    # import torchvision
+    # import torch
+    # plt.rcParams["savefig.bbox"] = 'tight'
+    
+    # def show(imgs):
+    #     if not isinstance(imgs, list):
+    #         imgs = [imgs]
+    #     fix, axs = plt.subplots(ncols=len(imgs), squeeze=False)
+    #     for i, img in enumerate(imgs):
+    #         img = img.detach()
+    #         img = F.to_pil_image(img)
+    #         axs[0, i].imshow(np.asarray(img))
+    #         axs[0, i].set(xticklabels=[], yticklabels=[], xticks=[], yticks=[])
+    
     # for x in train_ds:
     #     print("Shape:", x["image"].shape)
-    #     print(x["image"].numpy().max())
-    #     q = np.quantile(x["image"].numpy(), 0.999)
-    #     plt.imshow(x["image"][0], vmax=q)
+    #     print(x["image"].numpy().min(), x["image"].numpy().max())
+    #     # plt.imshow(x["image"][0,...,:3])
+    #     xt = torch.from_numpy(x["image"].numpy())
+    #     # xt = torch.permute(xt, (0,3,1,2))
+    #     xt = torchvision.utils.make_grid(xt)
+    #     show(xt)
     #     plt.savefig(f"{config.data.dataset}.png")
     #     break
     # exit()
