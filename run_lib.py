@@ -384,7 +384,7 @@ def evaluate(config, workdir, eval_folder="eval"):
 
     begin_ckpt = config.eval.begin_ckpt
     logging.info("begin checkpoint: %d" % (begin_ckpt,))
-    for ckpt in range(begin_ckpt, config.eval.end_ckpt + 1):
+    for ckpt in range(begin_ckpt, config.eval.end_ckpt + 1, 2):
         # Wait if the target checkpoint doesn't exist yet
         waiting_message_printed = False
         ckpt_filename = os.path.join(checkpoint_dir, "checkpoint_{}.pth".format(ckpt))
@@ -495,23 +495,27 @@ def evaluate(config, workdir, eval_folder="eval"):
                     np.savez_compressed(io_buffer, samples=samples)
                     fout.write(io_buffer.getvalue())
 
-                # Force garbage collection before calling TensorFlow code for Inception network
-                gc.collect()
-                latents = evaluation.run_inception_distributed(
-                    samples, inception_model, inceptionv3=inceptionv3
-                )
-                # Force garbage collection again before returning to JAX code
-                gc.collect()
-                # Save latent represents of the Inception network to disk or Google Cloud Storage
-                with tf.io.gfile.GFile(
-                    os.path.join(this_sample_dir, f"statistics_{r}.npz"), "wb"
-                ) as fout:
-                    io_buffer = io.BytesIO()
-                    np.savez_compressed(
-                        io_buffer, pool_3=latents["pool_3"], logits=latents["logits"]
+                if config.eval.compute_fid:
+                    # Force garbage collection before calling TensorFlow code for Inception network
+                    gc.collect()
+                    latents = evaluation.run_inception_distributed(
+                        samples, inception_model, inceptionv3=inceptionv3
                     )
-                    fout.write(io_buffer.getvalue())
+                    # Force garbage collection again before returning to JAX code
+                    gc.collect()
+                    # Save latent represents of the Inception network to disk or Google Cloud Storage
+                    with tf.io.gfile.GFile(
+                        os.path.join(this_sample_dir, f"statistics_{r}.npz"), "wb"
+                    ) as fout:
+                        io_buffer = io.BytesIO()
+                        np.savez_compressed(
+                            io_buffer,
+                            pool_3=latents["pool_3"],
+                            logits=latents["logits"],
+                        )
+                        fout.write(io_buffer.getvalue())
 
+        if config.eval.compute_fid:
             # Compute inception scores, FIDs and KIDs.
             # Load all statistics that have been previously computed and saved for each host
             all_logits = []
@@ -570,17 +574,17 @@ def compute_scores(config, workdir, score_folder="scores"):
     tf.io.gfile.makedirs(score_dir)
 
     # Build data pipeline
-    # train_ds, eval_ds, _ = datasets.get_dataset(
-    #     config,
-    #     uniform_dequantization=config.data.uniform_dequantization,
-    #     evaluation=True,
-    # )
-
     inlier_ds, ood_ds, _ = datasets.get_dataset(
         config,
         uniform_dequantization=config.data.uniform_dequantization,
         evaluation=True,
         ood_eval=True,
+    )
+
+    train_ds, eval_ds, _ = datasets.get_dataset(
+        config,
+        uniform_dequantization=config.data.uniform_dequantization,
+        evaluation=True,
     )
 
     # Create data normalizer and its inverse
@@ -623,18 +627,6 @@ def compute_scores(config, workdir, score_folder="scores"):
     if config.data.mask_marginals:
         channels -= 1
 
-    def scorer(score_fn, x):
-        # scores = np.zeros((n_timesteps, *x.shape))
-        scores = np.zeros((n_timesteps, x.shape[0], channels, img_sz, img_sz))
-        with torch.no_grad():
-            for i in range(n_timesteps):
-                t = timesteps[i]
-                vec_t = torch.ones(x.shape[0], device=config.device) * t
-                std = sde.marginal_prob(torch.zeros_like(x), vec_t)[1]
-                score = score_fn(x, vec_t) * std[:, None, None, None]
-                scores[i, ...] = score.cpu().numpy()
-        return scores
-
     # Initialize model\
     with torch.no_grad():
         score_model = mutils.create_model(config)
@@ -661,61 +653,151 @@ def compute_scores(config, workdir, score_folder="scores"):
         )
         ckpt = state["step"]
         logging.info(f"Loaded checkpoint {ckpt}")
-
+        tf.io.gfile.makedirs(f"{score_dir}/ckpt_{ckpt}")
         del state
 
+    score_dir = os.path.join(score_dir, f"ckpt_{ckpt}")
+
+    if config.msma.zscale:
+
+        stats_filename = os.path.join(score_dir, "eval_stats.npz")
+        if not tf.io.gfile.exists(stats_filename):
+            raise FileNotFoundError(
+                f"No eval stats file at {stats_filename}. Mean statistics are required for z-scaling"
+            )
+
+        with np.load(stats_filename) as f:
+            score_means = torch.from_numpy(f["mean"]).cuda()
+            score_stds = torch.from_numpy(f["mean_std"]).cuda()
+
+        score_dir = os.path.join(score_dir, "zscaled")
+        tf.io.gfile.makedirs(score_dir)
+
+    def scorer(score_fn, x, return_norm=True, step=1):
+
+        # Background mask
+        mask = (inverse_scaler(x) != 0.0).float()
+
+        if return_norm:
+            scores = np.zeros((n_timesteps, x.shape[0]), dtype=np.float32)
+        else:
+            sz = len(list(range(0, n_timesteps, step)))
+            scores = np.zeros((sz, *x.shape), dtype=np.float32)
+
+        with torch.no_grad():
+            for i, tidx in enumerate(range(0, n_timesteps, step)):
+                # logging.info(f"sigma {i}")
+                t = timesteps[tidx]
+                vec_t = torch.ones(x.shape[0], device=config.device) * t
+                std = sde.marginal_prob(torch.zeros_like(x), vec_t)[1]
+                score = score_fn(x, vec_t) * std[:, None, None, None]
+                score = torch.abs(score)
+                if config.msma.zscale:
+                    score = score - score_means[i]
+                    # score = score / score_stds[i]
+
+                score = score * mask
+                score = score.cpu().numpy()
+
+                if return_norm:
+                    score = (
+                        np.linalg.norm(
+                            score.reshape((score.shape[0], -1)),
+                            axis=-1,
+                        )
+                        # * std
+                    )
+                # else:
+                #     score = score
+
+                scores[i, ...] = score.copy()
+                # del score
+
+        return scores
+
     dataset_dict = {
-        "train": inlier_ds,
-        # "eval": eval_ds,
-        "test": ood_ds,
-        # "ood": ood_ds,
+        # "train": train_ds,
+        "eval": eval_ds,
+        # "inlier": inlier_ds,
     }
-    score_dict = {}
-    score_norm_dict = {}
+
+    if config.data.ood_ds != "None":
+        print(f"OOD Dataset: {config.data.ood_ds}")
+        dataset_dict["ood"] = ood_ds
 
     for name, ds in dataset_dict.items():
-        logging.info(f"Computing scores for {name} set")
+        if name == config.msma.ignore_ds:
+            logging.info(f"Skipping {name}")
+            continue
 
-        all_scores = None
+        logging.info(f"Computing scores for {name} set")
+        sample_batch = None
+        sample_batch_scores = None
         score_norms = []
 
         for i, batch in enumerate(ds):
-            x_batch = (
-                torch.from_numpy(batch["image"]._numpy()).to(config.device).float()
-            )
-            x_batch = x_batch.permute(0, 3, 1, 2)
+
+            if not isinstance(ds, torch.utils.data.DataLoader):
+                x_batch = (
+                    torch.from_numpy(batch["image"]._numpy()).to(config.device).float()
+                )
+                x_batch = x_batch.permute(0, 3, 1, 2)
+            else:
+                x_batch = batch["image"].to(config.device).float()
+
+            # x_batch = (
+            #     torch.from_numpy(batch["image"]._numpy()).to(config.device).float()
+            # )
+            # x_batch = x_batch.permute(0, 3, 1, 2)
             x_batch = scaler(x_batch)
-            x_score = scorer(score_fn, x_batch)
+            x_score_norms = scorer(score_fn, x_batch, return_norm=True)
+            score_norms.append(x_score_norms)
 
-            if all_scores is None:
-                all_scores = [x_score[::10, ::8, ...]]
+            if sample_batch is None:
+                logging.info(f"Recording first batch for {name} set")
+                sample_batch = batch["image"].numpy()
+                sample_batch_scores = scorer(
+                    score_fn, x_batch[:8, ...], return_norm=False, step=n_timesteps // 5
+                )
 
-            x_score_norm = np.linalg.norm(
-                x_score.reshape((x_score.shape[0], x_score.shape[1], -1)), axis=-1
-            )
-            score_norms.append(x_score_norm)
+            # TODO: Move this into the eval function
+            # batch_scores = scorer(score_fn, x_batch, return_norm=False, step=1)
+            # if (i + 1) % 1 == 0:
+            #     logging.info("Finished step %d for score evaluation" % (i + 1))
 
-            if (i + 1) % 2 == 0:
-                logging.info("Finished step %d for score evaluation" % (i + 1))
+            # with tf.io.gfile.GFile(
+            #     os.path.join(score_dir, f"ckpt_{ckpt}", f"{name}_scores_batch_{i}.npz"),
+            #     "wb",
+            # ) as fout:
+            #     io_buffer = io.BytesIO()
+            #     np.savez_compressed(
+            #         io_buffer,
+            #         batch_scores,
+            #     )
+            #     fout.write(io_buffer.getvalue())
 
-        all_scores = np.concatenate(all_scores, axis=1)
         score_norms = np.concatenate(score_norms, axis=1)
-        score_dict[name] = all_scores
-        score_norm_dict[name] = score_norms
 
-    # Save loss values to disk or Google Cloud Storage
-    # ckpt = "latest"
-    # TODO: Save norms in different file
-    with tf.io.gfile.GFile(
-        os.path.join(score_dir, f"ckpt_{ckpt}_scores.npz"), "wb"
-    ) as fout:
-        io_buffer = io.BytesIO()
-        np.savez_compressed(io_buffer, **score_dict)
-        fout.write(io_buffer.getvalue())
+        if name == "ood":
+            if config.data.gen_ood:
+                name = "gen-ood"
+            else:
+                name = config.data.ood_ds
 
-    with tf.io.gfile.GFile(
-        os.path.join(score_dir, f"ckpt_{ckpt}_score_norms.npz"), "wb"
-    ) as fout:
-        io_buffer = io.BytesIO()
-        np.savez_compressed(io_buffer, **score_norm_dict)
-        fout.write(io_buffer.getvalue())
+        elif name in ["test", "ood"] and config.data.ood_ds == "IBIS":
+            name = f"IBIS-{name}"
+
+        with tf.io.gfile.GFile(
+            os.path.join(score_dir, f"{name}_score_dict.npz"),
+            "wb",
+        ) as fout:
+            io_buffer = io.BytesIO()
+            np.savez_compressed(
+                io_buffer,
+                **{
+                    "sample_batch": sample_batch,
+                    "sample_scores": sample_batch_scores,
+                    "score_norms": score_norms,
+                },
+            )
+            fout.write(io_buffer.getvalue())
