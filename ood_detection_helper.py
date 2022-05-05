@@ -170,7 +170,7 @@ def auxiliary_model_analysis(
             flow_train_score, flow_test_score, flow_ood_scores, flow_metrics
         )
     else:
-        flow_results=None
+        flow_results = None
 
     print("=====" * 5 + " Training KD Tree " + "=====" * 5)
 
@@ -469,8 +469,8 @@ def ood_metrics(
         )
         axs[1].legend()
         fig.suptitle("{} vs {}".format(*names), fontsize=20)
-        plt.show()
-        plt.close()
+    #         plt.show()
+    #         plt.close()
 
     if verbose:
         print("{} vs {}".format(*names))

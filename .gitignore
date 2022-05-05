@@ -1,7 +1,7 @@
 # Repo specific ignores
-.png
-.jpg
-.ipynb
+*.png
+*.jpg
+*.ipynb
 docker/
 workdir/
 .ipynb_checkpoints/

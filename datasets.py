@@ -23,12 +23,16 @@ import tensorflow as tf
 import numpy as np
 import tensorflow_datasets as tfds
 import tensorflow_addons as tfa
+import pandas as pd
 
-from mri_utils import complex_magnitude
+from mri_utils import complex_magnitude, RandTumor
 from fastmri import FastKnee, FastKneeTumor
 from monai.data import CacheDataset, DataLoader, ArrayDataset, PersistentDataset
 from monai.transforms import *
 from PIL import Image
+
+from DataLoaderAnomaly import AnomalyDataLoader, TransformFrames
+
 
 class RandomPattern:
     """
@@ -118,6 +122,7 @@ class RandomPattern:
         if self.update_freq * (self.max_size ** 2) < self.points_used:
             self.regenerate_cache()
         return mask.astype("uint8")
+
 
 def get_channel_selector(config):
     c = config.data.select_channel
@@ -278,7 +283,6 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
     elif config.data.dataset == "MVTEC":
         dataset_dir = f"{config.data.dir_path}/{config.data.category}"
         dataset_builder = tfds.ImageFolder(dataset_dir)
-        
 
         # This is image size BEFORE translate + crop
         # e.g 1024 -> 200 - augment -> crop to 128
@@ -320,12 +324,12 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
             img = tf.image.random_flip_up_down(img)
 
             return img
-        
+
         tmp = tf.zeros((config.data.image_size, config.data.image_size, 1))
         mask_generator = RandomPattern()
-        
+
         def mask_op(img):
-            
+
             if evaluation:
                 mask = tf.ones_like(tmp)
                 img = tf.concat([img, mask], axis=-1)
@@ -493,7 +497,7 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
             eval_ds = build_ds(val_dir, ood=True).take(test_slices)
 
         dataset_builder = train_split_name = eval_split_name = None
-    
+
     elif config.data.dataset == "BRAIN":
         dataset_dir = config.data.dir_path
         splits_dir = config.data.splits_path
@@ -501,7 +505,7 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
         clean = lambda x: x.strip().replace("_", "")
         # print("Dir for keys:", splits_dir)
         filenames = {}
-        for split in ["train", "val", "test", "ood"]:
+        for split in ["train", "val", "test"]:
             with open(os.path.join(splits_dir, f"{split}_keys.txt"), "r") as f:
                 filenames[split] = [clean(x) for x in f.readlines()]
 
@@ -520,11 +524,6 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
             for x in filenames["test"]
         ]
 
-        ood_file_list = [
-            {"image": os.path.join(dataset_dir, f"{x}.nii.gz")}
-            for x in filenames["ood"]
-        ]
-
         img_sz = config.data.image_size
         cache = config.data.cache_rate
         channel_selector = get_channel_selector(config)
@@ -532,12 +531,13 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
 
         def fetch_mid_axial_slices(x, val=False):
             if evaluation:
-                fetched_slice = x.shape[3]//2
-            else:
-                fetched_slice = np.random.randint(x.shape[3]//2-5, x.shape[3]//2+5)
-            
+                fetched_slice = x.shape[3] // 2
+            else:  # [mid-2 : mid+2]
+                fetched_slice = np.random.randint(
+                    x.shape[3] // 2 - 2, x.shape[3] // 2 + 3
+                )
+
             return channel_selector(x[:, :, fetched_slice, :])
-    
 
         train_transform = Compose(
             [
@@ -556,11 +556,11 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
                     rotate_range=[0.03, 0.03, 0.03],
                     translate_range=3,
                 ),
-                RandLambdad("image", func = fetch_mid_axial_slices),
+                RandLambdad("image", func=fetch_mid_axial_slices),
                 # RandLambdad("image", func = resize_op),
                 ToTensord("image"),
                 TorchVisiond("image", "Resize", size=(img_sz, img_sz), antialias=True),
-                ScaleIntensityd("image", minv=0, maxv=1.0)
+                ScaleIntensityd("image", minv=0, maxv=1.0),
             ]
         )
 
@@ -570,10 +570,10 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
                 SqueezeDimd("image", dim=3),
                 AsChannelFirstd("image"),
                 SpatialCropd("image", roi_start=[11, 9, 0], roi_end=[172, 205, 152]),
-                RandLambdad("image", func = fetch_mid_axial_slices),
+                RandLambdad("image", func=fetch_mid_axial_slices),
                 ToTensord("image"),
                 TorchVisiond("image", "Resize", size=(img_sz, img_sz), antialias=True),
-                ScaleIntensityd("image", minv=0, maxv=1.0)
+                ScaleIntensityd("image", minv=0, maxv=1.0),
             ]
         )
 
@@ -581,127 +581,167 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
         #     train_file_list, img_transform=train_transform
         # )
 
-        train_ds = PersistentDataset(
-                train_file_list, transform=train_transform,
-                cache_dir=cache_dir_name,
+        if not evaluation:
+            train_ds = PersistentDataset(
+                train_file_list, transform=train_transform, cache_dir=cache_dir_name,
             )
 
-        eval_ds = CacheDataset(
-            val_file_list, transform=val_transform,
-            cache_rate=cache,num_workers=4
-         )
+            eval_ds = CacheDataset(
+                val_file_list, transform=val_transform, cache_rate=cache, num_workers=6
+            )
 
-        # if not evaluation:
-        #     train_ds = PersistentDataset(
-        #         train_file_list, transform=train_transform, cache_dir=cache_dir_name,
-        #     )
+        elif not ood_eval:
+            train_ds = CacheDataset(
+                train_file_list,
+                transform=val_transform,
+                cache_rate=cache,
+                num_workers=4,
+            )
 
-        #     eval_ds = CacheDataset(
-        #         val_file_list,
-        #         transform=val_transform,
-        #         cache_rate=CACHE_RATE,
-        #         num_workers=4,
-        #     )
+            eval_ds = CacheDataset(
+                val_file_list, transform=val_transform, cache_rate=cache, num_workers=4,
+            )
 
-        # elif not ood_eval:
-        #     train_ds = CacheDataset(
-        #         train_file_list,
-        #         transform=val_transform,
-        #         cache_rate=CACHE_RATE,
-        #         num_workers=4,
-        #     )
+        else:  # evaluation AND ood_eval
+            train_ds = None
+            inlier_file_list = test_file_list
+            img_transform = val_transform
 
-        #     eval_ds = CacheDataset(
-        #         val_file_list,
-        #         transform=val_transform,
-        #         cache_rate=CACHE_RATE,
-        #         num_workers=4,
-        #     )
+            # Generate OOD samples by adding "tumors" to center
+            # i.e. compute random grid deformations
+            if config.data.gen_ood:
+                deformer = RandTumor(
+                    spacing=1.0,
+                    max_tumor_size=5.0 / config.data.spacing_pix_dim,
+                    magnitude_range=(
+                        5.0 / config.data.spacing_pix_dim,
+                        15.0 / config.data.spacing_pix_dim,
+                    ),
+                    prob=1.0,
+                    spatial_size=config.data.image_size,  # [168, 200, 152],
+                    padding_mode="zeros",
+                )
 
-        # else:  # evaluation AND ood_eval
-        #     train_ds = None
-        #     inlier_file_list = test_file_list
-        #     img_transform = val_transform
+                deformer.set_random_state(seed=0)
 
-        #     # Generate OOD samples by adding "tumors" to center
-        #     # i.e. compute random grid deformations
-        #     if config.data.gen_ood:
-        #         deformer = RandTumor(
-        #             spacing=1.0,
-        #             max_tumor_size=5.0 / config.data.spacing_pix_dim,
-        #             magnitude_range=(
-        #                 5.0 / config.data.spacing_pix_dim,
-        #                 15.0 / config.data.spacing_pix_dim,
-        #             ),
-        #             prob=1.0,
-        #             spatial_size=config.data.image_size,  # [168, 200, 152],
-        #             padding_mode="zeros",
-        #         )
+                ood_transform = Compose(
+                    [
+                        LoadImaged("image", image_only=True),
+                        SqueezeDimd("image", dim=3),
+                        AsChannelFirstd("image"),
+                        SpatialCropd(
+                            "image", roi_start=[11, 9, 0], roi_end=[172, 205, 152]
+                        ),
+                        RandLambdad("image", func=fetch_mid_axial_slices),
+                        RandLambdad("image", deformer),
+                        ToTensord("image"),
+                        TorchVisiond(
+                            "image", "Resize", size=(img_sz, img_sz), antialias=True
+                        ),
+                        ScaleIntensityd("image", minv=0, maxv=1.0),
+                    ]
+                )
 
-        #         deformer.set_random_state(seed=0)
+                ood_file_list = test_file_list
+                img_transform = ood_transform
 
-        #         ood_transform = Compose(
-        #             [
-        #                 LoadImaged("image", image_only=True),
-        #                 SqueezeDimd("image", dim=3),
-        #                 AsChannelFirstd("image"),
-        #                 SpatialCropd(
-        #                     "image", roi_start=[11, 9, 0], roi_end=[172, 205, 152]
-        #                 ),
-        #                 Spacingd("image", pixdim=spacing),
-        #                 DivisiblePadd("image", k=8),
-        #                 RandLambdad("image", deformer),
-        #             ]
-        #         )
+            elif config.data.ood_ds == "IBIS":
+                filenames = {}
+                for split in ["ibis_inlier", "ibis_outlier"]:
+                    with open(os.path.join(splits_dir, f"{split}_keys.txt"), "r") as f:
+                        filenames[split] = [x.strip() for x in f.readlines()]
 
-        #         ood_file_list = test_file_list
-        #         img_transform = ood_transform
+                inlier_file_list = [
+                    {"image": os.path.join(dataset_dir, "ibis", f"{x}.nii.gz")}
+                    for x in filenames["ibis_inlier"]
+                ]
 
-        #     elif config.data.ood_ds == "IBIS":
-        #         filenames = {}
-        #         for split in ["ibis_inlier", "ibis_outlier"]:
-        #             with open(os.path.join(splits_dir, f"{split}_keys.txt"), "r") as f:
-        #                 filenames[split] = [x.strip() for x in f.readlines()]
+                ood_file_list = [
+                    {"image": os.path.join(dataset_dir, "ibis", f"{x}.nii.gz")}
+                    for x in filenames["ibis_outlier"]
+                ]
 
-        #         inlier_file_list = [
-        #             {"image": os.path.join(dataset_dir, "ibis", f"{x}.nii.gz")}
-        #             for x in filenames["ibis_inlier"]
-        #         ]
+            elif "LESION" in config.data.ood_ds:
+                suffix = ""
+                if "-" in config.data.ood_ds:
+                    _, suffix = config.data.ood_ds.split("-")
+                    suffix = "-" + suffix
 
-        #         ood_file_list = [
-        #             {"image": os.path.join(dataset_dir, "ibis", f"{x}.nii.gz")}
-        #             for x in filenames["ibis_outlier"]
-        #         ]
+                dirname = "lesion" + suffix
 
-        #     elif "LESION" in config.data.ood_ds:
-        #         suffix = ""
-        #         if "-" in config.data.ood_ds:
-        #             _, suffix = config.data.ood_ds.split("-")
-        #             suffix = "-" + suffix
+                ood_file_list = [
+                    {"image": x}
+                    for x in glob.glob(os.path.join(dataset_dir, "..", dirname, "*"))
+                ]
+                print("Collected samples:", len(ood_file_list), "from", dirname)
 
-        #         dirname = "lesion" + suffix
+            # Load either real or generated ood samples
+            # Defaults to ABCD test/ood data
+            train_ds = CacheDataset(
+                inlier_file_list, transform=val_transform, cache_rate=0, num_workers=4,
+            )
 
-        #         ood_file_list = [
-        #             {"image": x}
-        #             for x in glob.glob(os.path.join(dataset_dir, "..", dirname, "*"))
-        #         ]
-        #         print("Collected samples:", len(ood_file_list), "from", dirname)
+            eval_ds = CacheDataset(
+                ood_file_list, transform=img_transform, cache_rate=0, num_workers=4,
+            )
 
-        #     # Load either real or generated ood samples
-        #     # Defaults to ABCD test/ood data
-        #     train_ds = CacheDataset(
-        #         inlier_file_list,
-        #         transform=val_transform,
-        #         cache_rate=CACHE_RATE * 0,
-        #         num_workers=4,
-        #     )
+    elif config.data.dataset == "FAMLI":
+        dataset_dir = "/FAMLI/Shared/C1_ML_Analysis/"
+        train_df = pd.read_csv(
+            os.path.join(
+                dataset_dir,
+                "CSV_files",
+                "ALL_C1_C2_cines_gt_ga_withmeta_masked_resampled_256_spc075_uuid_study_flyto_uuid_train.csv",
+            )
+        )
+        # print(np.unique(train_df.tag, return_counts=True))
 
-        #     eval_ds = CacheDataset(
-        #         ood_file_list,
-        #         transform=img_transform,
-        #         cache_rate=CACHE_RATE * 0,
-        #         num_workers=4,
-        #     )
+        train_df = train_df.loc[train_df["tag"].isin(["BPD", "HC"])]
+        train_df = train_df.loc[:, ["file_path", "ga_boe", "tag", "study_id"]]
+        train_df = train_df.query("126 <= ga_boe and ga_boe <= 210").reset_index(
+            drop=True
+        )
+
+        eval_df = pd.read_csv(
+            os.path.join(
+                dataset_dir,
+                "CSV_files",
+                "ALL_C1_C2_cines_gt_ga_withmeta_masked_resampled_256_spc075_uuid_study_flyto_uuid_valid.csv",
+            )
+        )
+        # print(np.unique(val_df.tag, return_counts=True))
+
+        INLIER_TAGS = ["BPD", "HC"]
+        OOD_TAGS = (
+            ["FL", "AC"] if config.data.ood_ds == "TAGS" else [config.data.ood_ds]
+        )  # ["FL", "AC"]
+
+        tags = OOD_TAGS if ood_eval else INLIER_TAGS
+        print(f"Using tags: {tags}")
+
+        val_df = eval_df.loc[eval_df["tag"].isin(INLIER_TAGS)]
+
+        if ood_eval and not config.data.gen_ood:
+            ood_df = eval_df.loc[eval_df["tag"].isin(OOD_TAGS)]
+            # ood_df = ood_df.loc[~ood_df.study_id.isin(val_df.study_id)]
+            # print("USING EXCLUSIVE OODs")
+            val_df = ood_df
+
+        val_df = val_df.loc[:, ["file_path", "ga_boe", "tag"]]
+        val_df = val_df.query("126 <= ga_boe and ga_boe <= 210").reset_index(drop=True)
+
+        print(f"Collected: {val_df.shape[0]} samples")
+
+        train_ds = AnomalyDataLoader(
+            train_df, mount_point=dataset_dir, transform=TransformFrames(training=True)
+        )
+
+        eval_ds = AnomalyDataLoader(
+            val_df if not ood_eval else val_df[0:1000:5].reset_index(),
+            mount_point=dataset_dir,
+            transform=TransformFrames(training=False, ood=config.data.gen_ood),
+            random_last=10,
+        )
 
     else:
         raise NotImplementedError(f"Dataset {config.data.dataset} not yet supported.")
@@ -749,7 +789,7 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
 
                 if not evaluation and config.training.rand_augment:
                     img = augment_op(img)
-                
+
                 if config.data.mask_marginals:
                     img = mask_op(img)
 
@@ -804,16 +844,22 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
 
         return ds.prefetch(prefetch_size)
 
-    if config.data.dataset in ["BRAIN"]:
+    if config.data.dataset in ["BRAIN", "FAMLI"]:
         from monai.data import DataLoader
 
         train_ds = DataLoader(
-            train_ds, batch_size=config.training.batch_size, shuffle=True,
-            num_workers=6
+            train_ds,
+            batch_size=config.training.batch_size,
+            shuffle=evaluation == False,
+            num_workers=4,
+            pin_memory=True,
         )
         eval_ds = DataLoader(
-            eval_ds, batch_size=config.eval.batch_size, shuffle=False,
-            num_workers=2
+            eval_ds,
+            batch_size=config.eval.batch_size,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True,
         )
 
         dataset_builder = None
@@ -826,33 +872,36 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
         train_ds = create_dataset(dataset_builder, train_split_name)
         eval_ds = create_dataset(dataset_builder, eval_split_name, val=True)
 
-    # #### Test if loader worked
-    # import matplotlib.pyplot as plt
-    # import torchvision.transforms.functional as F
-    # import torchvision
-    # import torch
-    # plt.rcParams["savefig.bbox"] = 'tight'
-    
-    # def show(imgs):
-    #     if not isinstance(imgs, list):
-    #         imgs = [imgs]
-    #     fix, axs = plt.subplots(ncols=len(imgs), squeeze=False)
-    #     for i, img in enumerate(imgs):
-    #         img = img.detach()
-    #         img = F.to_pil_image(img)
-    #         axs[0, i].imshow(np.asarray(img))
-    #         axs[0, i].set(xticklabels=[], yticklabels=[], xticks=[], yticks=[])
-    
-    # for x in train_ds:
-    #     print("Shape:", x["image"].shape)
-    #     print(x["image"].numpy().min(), x["image"].numpy().max())
-    #     # plt.imshow(x["image"][0,...,:3])
-    #     xt = torch.from_numpy(x["image"].numpy())
-    #     # xt = torch.permute(xt, (0,3,1,2))
-    #     xt = torchvision.utils.make_grid(xt)
-    #     show(xt)
-    #     plt.savefig(f"{config.data.dataset}.png")
-    #     break
-    # exit()
+    #### Test if loader worked
+    if config.data.dry_run:
+        import matplotlib.pyplot as plt
+        import torchvision.transforms.functional as F
+        import torchvision
+        import torch
+
+        plt.rcParams["savefig.bbox"] = "tight"
+
+        def show(imgs):
+            if not isinstance(imgs, list):
+                imgs = [imgs]
+            fix, axs = plt.subplots(ncols=len(imgs), squeeze=False)
+            for i, img in enumerate(imgs):
+                img = img.detach()
+                img = F.to_pil_image(img)
+                im = axs[0, i].imshow(np.asarray(img))
+                axs[0, i].set(xticklabels=[], yticklabels=[], xticks=[], yticks=[])
+                # fix.colorbar(im, ax=axs[0, i])
+
+        for x in train_ds:
+            print("Shape:", x["image"].shape)
+            print(x["image"].numpy().min(), x["image"].numpy().max())
+            xt = torch.from_numpy(x["image"].numpy()[:32])
+            # # xt = torch.permute(xt, (0,3,1,2))
+            xt = torchvision.utils.make_grid(xt, nrow=4)
+            show(xt)
+            name = config.data.ood_ds if ood_eval else config.data.dataset
+            plt.savefig(f"{name}-{config.data.select_channel}.png", dpi=200)
+            break
+        exit()
 
     return train_ds, eval_ds, dataset_builder
