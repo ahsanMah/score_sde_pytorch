@@ -17,8 +17,10 @@
 """Training and evaluation for score-based generative models. """
 
 import gc
+import glob
 import io
 import os
+import re
 import time
 
 import numpy as np
@@ -28,6 +30,7 @@ import logging
 
 # Keep the import below for registering all model definitions
 from models import ddpm, ncsnv2, ncsnpp, ncsnpp3d
+from models.dgmm import DGMM, build_optimizer, gmm_train_step
 import losses
 import sampling
 from models import utils as mutils
@@ -38,10 +41,12 @@ import likelihood
 import sde_lib
 from absl import flags
 import torch
+import torch.profiler
 from torch.utils import tensorboard
 from torchvision.utils import make_grid, save_image
 from utils import save_checkpoint, restore_checkpoint
 from torchinfo import summary
+from tqdm.auto import tqdm
 
 FLAGS = flags.FLAGS
 
@@ -179,84 +184,95 @@ def train(config, workdir):
 
     num_train_steps = config.training.n_iters
 
-    # In case there are multiple hosts (e.g., TPU pods), only log to host 0
-    logging.info("Starting training loop at step %d." % (initial_step,))
+    with torch.profiler.profile(
+        schedule=torch.profiler.schedule(wait=2, warmup=2, active=3, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(tb_dir),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+    ) as profiler:
 
-    for step in range(initial_step, num_train_steps + 1):
-        # Convert data to JAX arrays and normalize them. Use ._numpy() to avoid copy.
-        if not isinstance(train_ds, torch.utils.data.DataLoader):
-            batch = (
-                torch.from_numpy(next(train_iter)["image"]._numpy())
-                .to(config.device)
-                .float()
-            )
-            batch = batch.permute(0, 3, 1, 2)
-        else:
-            batch = next(train_iter)["image"].to(config.device).float()
+        # In case there are multiple hosts (e.g., TPU pods), only log to host 0
+        logging.info("Starting training loop at step %d." % (initial_step,))
 
-        batch = scaler(batch)
-        # print("Train shape:", batch.shape)
-        # Execute one training step
-        loss = train_step_fn(state, batch)
-        if step % config.training.log_freq == 0:
-            logging.info("step: %d, training_loss: %.5e" % (step, loss.item()))
-            writer.add_scalar("training_loss", loss, step)
-
-        # Save a temporary checkpoint to resume training after pre-emption periodically
-        if step != 0 and step % config.training.snapshot_freq_for_preemption == 0:
-            save_checkpoint(checkpoint_meta_dir, state)
-
-        # Report the loss on an evaluation dataset periodically
-        if step % config.training.eval_freq == 0:
+        for step in range(initial_step, num_train_steps + 1):
+            # Convert data to JAX arrays and normalize them. Use ._numpy() to avoid copy.
             if not isinstance(train_ds, torch.utils.data.DataLoader):
-                eval_batch = (
-                    torch.from_numpy(next(eval_iter)["image"]._numpy())
+                batch = (
+                    torch.from_numpy(next(train_iter)["image"]._numpy())
                     .to(config.device)
                     .float()
                 )
-                eval_batch = eval_batch.permute(0, 3, 1, 2)
+                batch = batch.permute(0, 3, 1, 2)
             else:
-                eval_batch = next(eval_iter)["image"].to(config.device).float()
+                batch = next(train_iter)["image"].to(config.device).float()
 
-            eval_batch = scaler(eval_batch)
-            eval_loss = eval_step_fn(state, eval_batch)
-            logging.info("step: %d, eval_loss: %.5e" % (step, eval_loss.item()))
-            writer.add_scalar("eval_loss", eval_loss.item(), step)
+            batch = scaler(batch)
 
-        # Save a checkpoint periodically and generate samples if needed
-        if (
-            step != 0
-            and step % config.training.snapshot_freq == 0
-            or step == num_train_steps
-        ):
-            # Save the checkpoint.
-            save_step = step // config.training.snapshot_freq
-            save_checkpoint(
-                os.path.join(checkpoint_dir, f"checkpoint_{save_step}.pth"), state
-            )
+            # Execute one training step
+            loss = train_step_fn(state, batch)
 
-            # Generate and save samples
-            if config.training.snapshot_sampling:
-                ema.store(score_model.parameters())
-                ema.copy_to(score_model.parameters())
-                sample, n = sampling_fn(score_model)
-                ema.restore(score_model.parameters())
-                this_sample_dir = os.path.join(sample_dir, "iter_{}".format(step))
-                tf.io.gfile.makedirs(this_sample_dir)
-                nrow = int(np.sqrt(sample.shape[0]))
-                image_grid = make_grid(sample, nrow, padding=2)
-                sample = np.clip(
-                    sample.permute(0, 2, 3, 1).cpu().numpy() * 255, 0, 255
-                ).astype(np.uint8)
-                with tf.io.gfile.GFile(
-                    os.path.join(this_sample_dir, "sample.np"), "wb"
-                ) as fout:
-                    np.save(fout, sample)
+            profiler.step()
 
-                with tf.io.gfile.GFile(
-                    os.path.join(this_sample_dir, "sample.png"), "wb"
-                ) as fout:
-                    save_image(image_grid, fout)
+            if step % config.training.log_freq == 0:
+                logging.info("step: %d, training_loss: %.5e" % (step, loss.item()))
+                writer.add_scalar("training_loss", loss, step)
+
+            # Save a temporary checkpoint to resume training after pre-emption periodically
+            if step != 0 and step % config.training.snapshot_freq_for_preemption == 0:
+                save_checkpoint(checkpoint_meta_dir, state)
+
+            # Report the loss on an evaluation dataset periodically
+            if step % config.training.eval_freq == 0:
+                if not isinstance(train_ds, torch.utils.data.DataLoader):
+                    eval_batch = (
+                        torch.from_numpy(next(eval_iter)["image"]._numpy())
+                        .to(config.device)
+                        .float()
+                    )
+                    eval_batch = eval_batch.permute(0, 3, 1, 2)
+                else:
+                    eval_batch = next(eval_iter)["image"].to(config.device).float()
+
+                eval_batch = scaler(eval_batch)
+                eval_loss = eval_step_fn(state, eval_batch)
+                logging.info("step: %d, eval_loss: %.5e" % (step, eval_loss.item()))
+                writer.add_scalar("eval_loss", eval_loss.item(), step)
+
+            # Save a checkpoint periodically and generate samples if needed
+            if (
+                step != 0
+                and step % config.training.snapshot_freq == 0
+                or step == num_train_steps
+            ):
+                # Save the checkpoint.
+                save_step = step // config.training.snapshot_freq
+                save_checkpoint(
+                    os.path.join(checkpoint_dir, f"checkpoint_{save_step}.pth"), state
+                )
+
+                # Generate and save samples
+                if config.training.snapshot_sampling:
+                    ema.store(score_model.parameters())
+                    ema.copy_to(score_model.parameters())
+                    sample, n = sampling_fn(score_model)
+                    ema.restore(score_model.parameters())
+                    this_sample_dir = os.path.join(sample_dir, "iter_{}".format(step))
+                    tf.io.gfile.makedirs(this_sample_dir)
+                    nrow = int(np.sqrt(sample.shape[0]))
+                    image_grid = make_grid(sample, nrow, padding=2)
+                    sample = np.clip(
+                        sample.permute(0, 2, 3, 1).cpu().numpy() * 255, 0, 255
+                    ).astype(np.uint8)
+                    with tf.io.gfile.GFile(
+                        os.path.join(this_sample_dir, "sample.np"), "wb"
+                    ) as fout:
+                        np.save(fout, sample)
+
+                    with tf.io.gfile.GFile(
+                        os.path.join(this_sample_dir, "sample.png"), "wb"
+                    ) as fout:
+                        save_image(image_grid, fout)
 
 
 def evaluate(config, workdir, eval_folder="eval"):
@@ -676,13 +692,16 @@ def compute_scores(config, workdir, score_folder="scores"):
     def scorer(score_fn, x, return_norm=True, step=1):
 
         # Background mask
-        mask = (inverse_scaler(x) != 0.0).float()
+        # FIXME: This might be aproblem for mask conditioned models
+        # mask = (inverse_scaler(x) != 0.0).float()
 
         if return_norm:
             scores = np.zeros((n_timesteps, x.shape[0]), dtype=np.float32)
         else:
             sz = len(list(range(0, n_timesteps, step)))
-            scores = np.zeros((sz, *x.shape), dtype=np.float32)
+            scores = np.zeros(
+                (sz, x.shape[0], 1, x.shape[1], x.shape[2]), dtype=np.float32
+            )
 
         with torch.no_grad():
             for i, tidx in enumerate(range(0, n_timesteps, step)):
@@ -696,7 +715,7 @@ def compute_scores(config, workdir, score_folder="scores"):
                     score = score - score_means[i]
                     # score = score / score_stds[i]
 
-                score = score * mask
+                # score = score * mask
                 score = score.cpu().numpy()
 
                 if return_norm:
@@ -716,9 +735,9 @@ def compute_scores(config, workdir, score_folder="scores"):
         return scores
 
     dataset_dict = {
-        # "train": train_ds,
+        "train": train_ds,
         "eval": eval_ds,
-        # "inlier": inlier_ds,
+        "inlier": inlier_ds,
     }
 
     if config.data.ood_ds != "None":
@@ -750,6 +769,7 @@ def compute_scores(config, workdir, score_folder="scores"):
             # )
             # x_batch = x_batch.permute(0, 3, 1, 2)
             x_batch = scaler(x_batch)
+            print(x_batch.shape)
             x_score_norms = scorer(score_fn, x_batch, return_norm=True)
             score_norms.append(x_score_norms)
 
@@ -801,3 +821,158 @@ def compute_scores(config, workdir, score_folder="scores"):
                 },
             )
             fout.write(io_buffer.getvalue())
+
+
+def dgmm_trainer(config, workdir):
+
+    # Build data pipeline
+    config.training.enable_augs = False
+    train_ds, eval_ds, _ = datasets.get_dataset(
+        config,
+        uniform_dequantization=config.data.uniform_dequantization,
+        evaluation=False,  # Dont augment data
+    )
+    img_sz = config.data.image_size
+
+    # Create data normalizer and its inverse
+    scaler = datasets.get_data_scaler(config)
+    inverse_scaler = datasets.get_data_inverse_scaler(config)
+
+    # Setup SDEs
+    sde, sampling_eps = sde_lib.setup_sde(config)
+
+    eps = config.msma.min_sigma
+    n_timesteps = config.msma.n_timesteps
+    msma_sigmas = torch.linspace(eps, 1.0, n_timesteps, device="cuda")
+    timesteps = sde.noise_schedule_inverse(msma_sigmas)
+
+    # Initialize model\
+    with torch.no_grad():
+        score_model = mutils.create_model(config)
+        optimizer = losses.get_optimizer(config, score_model.parameters())
+        ema = ExponentialMovingAverage(
+            score_model.parameters(), decay=config.model.ema_rate
+        )
+        state = dict(optimizer=optimizer, model=score_model, ema=ema, step=0)
+
+        # Loading latest intermediate checkpoint
+        ckpt = config.msma.checkpoint
+        if ckpt == -1:  # latest-checkpoint
+            checkpoint_dir = os.path.join(workdir, "checkpoints-meta", "checkpoint.pth")
+        else:
+            checkpoint_dir = os.path.join(
+                workdir, "checkpoints", f"checkpoint_{ckpt}.pth"
+            )
+
+        state = restore_checkpoint(checkpoint_dir, state, config.device)
+        ema = state["ema"]
+        ema.copy_to(score_model.parameters())
+        score_fn = mutils.get_score_fn(
+            sde, score_model, train=False, continuous=config.training.continuous
+        )
+        ckpt = state["step"]
+        logging.info(f"Loaded checkpoint {ckpt}")
+        del state
+
+    tb_dir = os.path.join(workdir, "tensorboard", "dgmm", f"score_ckpt_{ckpt}")
+    tf.io.gfile.makedirs(tb_dir)
+    writer = tensorboard.SummaryWriter(tb_dir)
+
+    dgmm_ckpt_dir = os.path.join(workdir, "checkpoints-dgmm", f"score_ckpt_{ckpt}")
+    tf.io.gfile.makedirs(dgmm_ckpt_dir)
+
+    # Initialize Deep GMM and optimizer
+    gmm = DGMM(mask_shape=(img_sz, img_sz), k_mixt=5, D=n_timesteps)
+    optimizer = build_optimizer()
+
+    # Setup vectorized score norm function
+    # def scorer(x):
+    #     with torch.no_grad():
+    #         x = scaler(x)  # Needed for score estimator
+    #         batch_sz = x.shape[0]
+    #         x = x.repeat_interleave(n_timesteps, dim=0)
+    #         vec_t = timesteps.repeat(batch_sz)
+    #         score = score_fn(x, vec_t)
+    #         score = score.view(batch_sz, n_timesteps, -1)
+    #         scores = torch.linalg.norm(score, axis=2) * msma_sigmas
+    #     return scores
+
+    def scorer(x):
+        x = scaler(x)
+        batch_size = x.shape[0]
+        scores = torch.zeros(
+            (batch_size, n_timesteps), dtype=torch.float32, device="cuda"
+        )
+
+        with torch.no_grad():
+            for i in range(n_timesteps):
+                t = timesteps[i]
+                vec_t = torch.ones(x.shape[0], device=config.device) * t
+                score = score_fn(x, vec_t)
+                scores[..., i] = torch.linalg.norm(
+                    score.reshape(batch_size, -1), axis=1
+                )
+
+        return scores * msma_sigmas
+
+    def train_step(scorer, gmm, opt, x_batch):
+        scores = scorer(x_batch).cpu().numpy()
+        mask = x_batch[:, -1, ..., None].cpu().numpy()
+        mask = tf.convert_to_tensor(mask)
+        loss = gmm_train_step(gmm, opt, (scores, mask))
+        return loss
+
+    def eval_step(scorer, gmm, x_batch):
+        scores = scorer(x_batch).cpu().numpy()
+        mask = x_batch[:, -1, ..., None].cpu().numpy()
+        mask = tf.convert_to_tensor(mask)
+        ll = gmm((scores, mask), training=False)
+        loss = gmm.log_loss(None, ll)
+        return loss
+
+    num_epochs = 10
+    eval_loss = 0.0
+    train_loss = 0.0
+    start_epoch = 0
+
+    if config.dgmm.resume:
+        last_ckpt = sorted(glob.glob(f"{dgmm_ckpt_dir}/ckpt_*.h5"))[-1]
+        start_epoch = 1 + int(re.search(".*ckpt_(\d*).h5", last_ckpt).group(1))
+        # Init model then load weights
+        dummy_input = (tf.zeros((1, 20)), tf.zeros((1, img_sz, img_sz, 1)))
+        gmm(dummy_input)
+        gmm.load_weights(last_ckpt)
+        logging.info(f"Loaded DGMM checkpoint from: {last_ckpt}")
+
+    progress_bar = tqdm(range(start_epoch, num_epochs))
+    progress_bar.set_description("[epoch: ?] | eval_loss: ? | train_loss: ?")
+    step = start_epoch * len(train_ds)
+    logging.info(f"Starting at step {step}")
+
+    for epoch in progress_bar:
+
+        train_iter = tqdm(iter(train_ds))
+
+        for i, batch in enumerate(train_iter):
+            x_batch = batch["image"].to(config.device).float()
+            # print(x_batch.shape)
+            train_loss = train_step(scorer, gmm, optimizer, x_batch)
+            writer.add_scalar("training_loss", train_loss.numpy(), step)
+
+            progress_bar.set_description(
+                f"[epoch {epoch:d}] | eval_loss {eval_loss:.3f} |  train_loss {train_loss:.3f}"
+            )
+            step += 1
+
+        eval_loss = 0
+        for i, eval_batch in enumerate(eval_ds):
+            x_batch = eval_batch["image"].to(config.device).float()
+            eval_loss += eval_step(scorer, gmm, x_batch)
+
+        eval_loss /= i + 1
+        progress_bar.set_description(
+            f"[epoch {epoch:d}] | eval_loss {eval_loss:.3f} |  train_loss {train_loss:.3f}"
+        )
+        writer.add_scalar("eval_loss", eval_loss.numpy(), step)
+
+        gmm.save_weights(f"{dgmm_ckpt_dir}/ckpt_{epoch}.h5")

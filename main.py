@@ -17,28 +17,28 @@
 import os
 
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-import run_lib
-from absl import app
-from absl import flags
-from ml_collections.config_flags import config_flags
-import logging
-import os
 import tensorflow as tf
 import warnings
 
 warnings.filterwarnings("ignore")
-
 gpus = tf.config.list_physical_devices("GPU")
+print("GPUS:", gpus)
 if gpus:
+    # tf.config.experimental.set_visible_devices(gpus[0], "GPU")
     try:
+        tf.config.experimental.set_memory_growth(gpus[0], True)
         # Currently, memory growth needs to be the same across GPUs
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
+        # for gpu in gpus:
         logical_gpus = tf.config.experimental.list_logical_devices("GPU")
         print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
     except RuntimeError as e:
         # Memory growth must be set before GPUs have been initialized
-        print(e)
+        print("Could not set memory growth w/ exception:", e)
+
+from absl import app, flags
+from ml_collections.config_flags import config_flags
+import logging
+import run_lib
 
 FLAGS = flags.FLAGS
 
@@ -47,7 +47,10 @@ config_flags.DEFINE_config_file(
 )
 flags.DEFINE_string("workdir", None, "Work directory.")
 flags.DEFINE_enum(
-    "mode", None, ["train", "eval", "score"], "Running mode: train or eval"
+    "mode",
+    None,
+    ["train", "eval", "score", "train_dgmm"],
+    "Running mode: train or eval",
 )
 flags.DEFINE_string(
     "eval_folder", "eval", "The folder name for storing evaluation results"
@@ -76,8 +79,11 @@ def main(argv):
         # Run the evaluation pipeline
         run_lib.evaluate(FLAGS.config, FLAGS.workdir, FLAGS.eval_folder)
     elif FLAGS.mode == "score":
-        # Run the evaluation pipeline
+        # Run the msma scorer pipeline
         run_lib.compute_scores(FLAGS.config, FLAGS.workdir)
+    elif FLAGS.mode == "train_dgmm":
+        # Run the depp gmm training pipeline
+        run_lib.dgmm_trainer(FLAGS.config, FLAGS.workdir)
     else:
         raise ValueError(f"Mode {FLAGS.mode} not recognized.")
 
