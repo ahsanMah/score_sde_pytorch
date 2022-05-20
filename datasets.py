@@ -15,10 +15,10 @@
 
 # pylint: skip-file
 """Return training and evaluation/test datasets from config files."""
-from tensorflow_datasets.core import dataset_info
-import os
+import os, re
 import glob
 import jax
+import torch
 import tensorflow as tf
 import numpy as np
 import tensorflow_datasets as tfds
@@ -29,9 +29,13 @@ from mri_utils import complex_magnitude, RandTumor
 from fastmri import FastKnee, FastKneeTumor
 from monai.data import CacheDataset, DataLoader, ArrayDataset, PersistentDataset
 from monai.transforms import *
+
+from torchvision import transforms
 from PIL import Image
 
 from DataLoaderAnomaly import AnomalyDataLoader, TransformFrames
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 
 class RandomPattern:
@@ -95,7 +99,7 @@ class RandomPattern:
         self.pattern = pattern
         self.points_used = 0
 
-    def __call__(self, image, density_std=0.05):
+    def __call__(self, image, density_std=0.05, channel_last=True):
         """
         Image is supposed to have shape [H, W, C].
         Return binary mask of the same shape, where for each object
@@ -106,7 +110,7 @@ class RandomPattern:
         there is no rectangle in the big matrix which fulfills
         the requirements.
         """
-        height, width, num_channels = image.shape
+        height, width = image.shape
         x = self.rng.randint(0, self.max_size - width + 1)
         y = self.rng.randint(0, self.max_size - height + 1)
         res = self.pattern[y : y + height, x : x + width]
@@ -116,12 +120,118 @@ class RandomPattern:
             y = self.rng.randint(0, self.max_size - height + 1)
             res = self.pattern[y : y + height, x : x + width]
             coverage = res.mean()
-        mask = np.tile(res[:, :, None], [1, 1, num_channels])
+        # mask = np.tile(res[:, :, None], [1, 1, num_channels])
+        if channel_last:
+            mask = res[:, :, None]
+        else:
+            mask = res[None, :, :]
+
         mask = 1.0 - mask
+        # sns.heatmap(mask[0])
+        # plt.savefig(f"imgs/MASK.png", dpi=200)
+        # exit()
         self.points_used += width * height
         if self.update_freq * (self.max_size ** 2) < self.points_used:
             self.regenerate_cache()
         return mask.astype("uint8")
+
+
+# class RandomPattern:
+#     """
+#     Reproduces "random pattern mask" for inpainting, which was proposed in
+#     Pathak, D., Krahenbuhl, P., Donahue, J., Darrell, T.,
+#     & Efros, A. A. Context Encoders: Feature Learning by Inpainting.
+#     Conference on Computer Vision and Pattern Recognition, 2016.
+#     ArXiv link: https://arxiv.org/abs/1604.07379
+#     This code is based on lines 273-283 and 316-330 of Context Encoders
+#     implementation:
+#     https://github.com/pathak22/context-encoder/blob/master/train_random.lua
+#     The idea is to generate small matrix with uniform random elements,
+#     then resize it using bicubic interpolation into a larger matrix,
+#     then binarize it with some threshold,
+#     and then crop a rectangle from random position and return it as a mask.
+#     If the rectangle contains too many or too few ones, the position of
+#     the rectangle is generated again.
+#     The big matrix is resampled when the total number of elements in
+#     the returned masks times update_freq is more than the number of elements
+#     in the big mask. This is done in order to find balance between generating
+#     the big matrix for each mask (which is involves a lot of unnecessary
+#     computations) and generating one big matrix at the start of the training
+#     process and then sampling masks from it only (which may lead to
+#     overfitting to the specific patterns).
+#     """
+
+#     def __init__(
+#         self, max_size=10000, resolution=0.06, density=0.25, update_freq=1, seed=239
+#     ):
+#         """
+#         Args:
+#             max_size (int):      the size of big binary matrix
+#             resolution (float):  the ratio of the small matrix size to
+#                                  the big one. Authors recommend to use values
+#                                  from 0.01 to 0.1.
+#             density (float):     the binarization threshold, also equals
+#                                  the average ones ratio in the mask
+#             update_freq (float): the frequency of the big matrix resampling
+#             seed (int):          random seed
+#         """
+#         self.max_size = max_size
+#         self.resolution = resolution
+#         self.density = density
+#         self.update_freq = update_freq
+#         self.rng = np.random.RandomState(seed)
+#         self.regenerate_cache()
+
+#     def regenerate_cache(self):
+#         """
+#         Resamples the big matrix and resets the counter of the total
+#         number of elements in the returned masks.
+#         """
+#         low_size = int(self.resolution * self.max_size)
+#         low_pattern = self.rng.uniform(0, 1, size=(low_size, low_size)) * 255
+#         low_pattern = torch.from_numpy(low_pattern.astype("float32"))
+#         pattern = transforms.Compose(
+#             [
+#                 transforms.ToPILImage(),
+#                 transforms.Resize(self.max_size, Image.BICUBIC),
+#                 transforms.ToTensor(),
+#             ]
+#         )(low_pattern[None])[0]
+#         pattern = torch.lt(pattern, self.density).byte()
+#         self.pattern = pattern.byte()
+#         self.points_used = 0
+
+#     def __call__(self, batch, density_std=0.05):
+#         """
+#         Batch is supposed to have shape [num_objects x num_channels x
+#         x width x height].
+#         Return binary mask of the same shape, where for each object
+#         the ratio of ones in the mask is in the open interval
+#         (self.density - density_std, self.density + density_std).
+#         The less is density_std, the longer is mask generation time.
+#         For very small density_std it may be even infinity, because
+#         there is no rectangle in the big matrix which fulfills
+#         the requirements.
+#         """
+#         batch_size, num_channels, width, height = batch.shape
+#         res = torch.zeros_like(batch, device="cpu")
+#         idx = list(range(batch_size))
+#         while idx:
+#             nw_idx = []
+#             x = self.rng.randint(0, self.max_size - width + 1, size=len(idx))
+#             y = self.rng.randint(0, self.max_size - height + 1, size=len(idx))
+#             for i, lx, ly in zip(idx, x, y):
+#                 res[i] = self.pattern[lx : lx + width, ly : ly + height][None]
+#                 coverage = float(res[i, 0].mean())
+#                 if not (
+#                     self.density - density_std < coverage < self.density + density_std
+#                 ):
+#                     nw_idx.append(i)
+#             idx = nw_idx
+#         self.points_used += batch_size * width * height
+#         if self.update_freq * (self.max_size ** 2) < self.points_used:
+#             self.regenerate_cache()
+#         return res
 
 
 def get_channel_selector(config):
@@ -405,7 +515,11 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
 
             # Min Max normalize
             img = (img - l) / (h - l)
-            img = np.clip(img, 0.0, 1.0,)
+            img = np.clip(
+                img,
+                0.0,
+                1.0,
+            )
 
             return img
 
@@ -529,6 +643,10 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
         channel_selector = get_channel_selector(config)
         cache_dir_name = "/tmp/monai_brains_nopad/train"
 
+        tmp = torch.zeros((config.data.image_size, config.data.image_size))
+        # print(tmp.shape)
+        mask_generator = RandomPattern()
+
         def fetch_mid_axial_slices(x, val=False):
             if evaluation:
                 fetched_slice = x.shape[3] // 2
@@ -539,55 +657,85 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
 
             return channel_selector(x[:, :, fetched_slice, :])
 
-        train_transform = Compose(
-            [
-                LoadImaged("image", image_only=True),
-                SqueezeDimd("image", dim=3),
-                AsChannelFirstd("image"),
-                SpatialCropd("image", roi_start=[11, 9, 0], roi_end=[172, 205, 152]),
-                RandStdShiftIntensityd("image", (-0.1, 0.1)),
-                # RandScaleIntensityd("image", (0.9, 1.1)),
-                RandScaleIntensityd("image", (-0.1, 0.1)),
-                RandHistogramShiftd("image", num_control_points=[3, 5]),
-                RandFlipd("image", prob=0.5, spatial_axis=0),
-                RandAffined(
-                    "image",
-                    prob=0.1,
-                    rotate_range=[0.03, 0.03, 0.03],
-                    translate_range=3,
-                ),
-                RandLambdad("image", func=fetch_mid_axial_slices),
-                # RandLambdad("image", func = resize_op),
-                ToTensord("image"),
-                TorchVisiond("image", "Resize", size=(img_sz, img_sz), antialias=True),
-                ScaleIntensityd("image", minv=0, maxv=1.0),
-            ]
-        )
+        def mask_op(img):
 
-        val_transform = Compose(
-            [
-                LoadImaged("image", image_only=True),
-                SqueezeDimd("image", dim=3),
-                AsChannelFirstd("image"),
-                SpatialCropd("image", roi_start=[11, 9, 0], roi_end=[172, 205, 152]),
-                RandLambdad("image", func=fetch_mid_axial_slices),
-                ToTensord("image"),
-                TorchVisiond("image", "Resize", size=(img_sz, img_sz), antialias=True),
-                ScaleIntensityd("image", minv=0, maxv=1.0),
-            ]
-        )
+            if not config.data.mask_marginals:
+                return img
+
+            if evaluation:
+                mask = torch.ones((1, img_sz, img_sz))
+                img = torch.cat((img, mask), dim=0)
+                return img
+
+            if np.random.uniform([1]) < 0.5:
+                mask = torch.ones((1, img_sz, img_sz))
+            else:
+                mask = torch.from_numpy(mask_generator(tmp, channel_last=False)).float()
+
+            img = img * mask
+            img = torch.cat((img, mask), dim=0)
+
+            # sns.heatmap(img[0])
+            # plt.savefig(f"imgs/BRAIN.png", dpi=200)
+            # exit()
+            return img
+
+        loading_transforms = [
+            LoadImaged("image", image_only=True),
+            SqueezeDimd("image", dim=3),
+            AsChannelFirstd("image"),
+            SpatialCropd("image", roi_start=[11, 9, 0], roi_end=[172, 205, 152]),
+        ]
+
+        augmentations = [
+            RandStdShiftIntensityd("image", (-0.1, 0.1)),
+            RandScaleIntensityd("image", (-0.1, 0.1)),
+            RandHistogramShiftd("image", num_control_points=[3, 5]),
+            RandFlipd("image", prob=0.5, spatial_axis=0),
+            RandAffined(
+                "image",
+                prob=0.1,
+                rotate_range=[0.03, 0.03, 0.03],
+                translate_range=3,
+            ),
+        ]
+        post_proc_transforms = [
+            RandLambdad("image", func=fetch_mid_axial_slices),
+            ToTensord("image"),
+            TorchVisiond("image", "Resize", size=(img_sz, img_sz), antialias=True),
+            ScaleIntensityd("image", minv=0, maxv=1.0),
+            RandLambdad("image", func=mask_op),
+        ]
+
+        train_transform = list(loading_transforms)
+        if config.training.enable_augs:
+            train_transform.extend(augmentations)
+        train_transform.extend(post_proc_transforms)
+
+        train_transform = Compose(train_transform)
+
+        val_transform = list(loading_transforms)
+        val_transform.extend(post_proc_transforms)
+        val_transform = Compose(val_transform)
 
         # train_ds = ArrayDataset(
         #     train_file_list, img_transform=train_transform
         # )
 
         if not evaluation:
-            train_ds = PersistentDataset(
-                train_file_list, transform=train_transform, cache_dir=cache_dir_name,
+            # train_ds = PersistentDataset(
+            #     train_file_list,
+            #     transform=train_transform,
+            #     cache_dir=cache_dir_name,
+            # )
+            train_ds = CacheDataset(
+                train_file_list,
+                transform=train_transform,
+                cache_rate=cache,
+                num_workers=10,
             )
-
             eval_ds = CacheDataset(
-                val_file_list, transform=val_transform, cache_rate=cache, num_workers=6
+                val_file_list, transform=val_transform, cache_rate=cache, num_workers=10
             )
 
         elif not ood_eval:
@@ -595,11 +743,14 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
                 train_file_list,
                 transform=val_transform,
                 cache_rate=cache,
-                num_workers=4,
+                num_workers=6,
             )
 
             eval_ds = CacheDataset(
-                val_file_list, transform=val_transform, cache_rate=cache, num_workers=4,
+                val_file_list,
+                transform=val_transform,
+                cache_rate=cache,
+                num_workers=6,
             )
 
         else:  # evaluation AND ood_eval
@@ -612,13 +763,13 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
             if config.data.gen_ood:
                 deformer = RandTumor(
                     spacing=1.0,
-                    max_tumor_size=5.0 / config.data.spacing_pix_dim,
+                    max_tumor_size=15.0 / config.data.spacing_pix_dim,
                     magnitude_range=(
                         5.0 / config.data.spacing_pix_dim,
                         15.0 / config.data.spacing_pix_dim,
                     ),
                     prob=1.0,
-                    spatial_size=config.data.image_size,  # [168, 200, 152],
+                    spatial_size=[168, 152],  # [168, 200, 152],
                     padding_mode="zeros",
                 )
 
@@ -639,6 +790,7 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
                             "image", "Resize", size=(img_sz, img_sz), antialias=True
                         ),
                         ScaleIntensityd("image", minv=0, maxv=1.0),
+                        RandLambdad("image", func=mask_op),
                     ]
                 )
 
@@ -662,6 +814,33 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
                 ]
 
             elif "LESION" in config.data.ood_ds:
+
+                # channel_selector = lambda x: np.expand_dims(x[0, ...], axis=0)
+                # Selects the first channel and middle slice
+                c = config.data.ood_ds_channel
+
+                def fetch_lesion_slices(x):
+                    fetched_slice = x.shape[3] // 2
+                    return np.expand_dims(x[c, :, fetched_slice, :], axis=0)
+
+                img_transform = Compose(
+                    [
+                        LoadImaged("image", image_only=True),
+                        SqueezeDimd("image", dim=3),
+                        AsChannelFirstd("image"),
+                        SpatialCropd(
+                            "image", roi_start=[11, 9, 0], roi_end=[172, 205, 152]
+                        ),
+                        RandLambdad("image", func=fetch_lesion_slices),
+                        ToTensord("image"),
+                        TorchVisiond(
+                            "image", "Resize", size=(img_sz, img_sz), antialias=True
+                        ),
+                        ScaleIntensityd("image", minv=0, maxv=1.0),
+                        RandLambdad("image", func=mask_op),
+                    ]
+                )
+
                 suffix = ""
                 if "-" in config.data.ood_ds:
                     _, suffix = config.data.ood_ds.split("-")
@@ -669,20 +848,34 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
 
                 dirname = "lesion" + suffix
 
+                skip_train_ids = (
+                    lambda x: re.search("(NDAR.*).nii.gz", x).group(1)
+                    not in filenames["train"]
+                )
+
                 ood_file_list = [
                     {"image": x}
-                    for x in glob.glob(os.path.join(dataset_dir, "..", dirname, "*"))
+                    for x in filter(
+                        skip_train_ids,
+                        glob.glob(os.path.join(dataset_dir, "..", dirname, "*")),
+                    )
                 ]
                 print("Collected samples:", len(ood_file_list), "from", dirname)
 
             # Load either real or generated ood samples
             # Defaults to ABCD test/ood data
             train_ds = CacheDataset(
-                inlier_file_list, transform=val_transform, cache_rate=0, num_workers=4,
+                inlier_file_list,
+                transform=val_transform,
+                cache_rate=0,
+                num_workers=4,
             )
 
             eval_ds = CacheDataset(
-                ood_file_list, transform=img_transform, cache_rate=0, num_workers=4,
+                ood_file_list,
+                transform=img_transform,
+                cache_rate=0,
+                num_workers=4,
             )
 
     elif config.data.dataset == "FAMLI":
@@ -851,14 +1044,16 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
             train_ds,
             batch_size=config.training.batch_size,
             shuffle=evaluation == False,
-            num_workers=4,
+            num_workers=config.data.workers,
+            prefetch_factor=2,
+            # persistent_workers=True,
             pin_memory=True,
         )
         eval_ds = DataLoader(
             eval_ds,
             batch_size=config.eval.batch_size,
             shuffle=False,
-            num_workers=4,
+            num_workers=config.data.workers,
             pin_memory=True,
         )
 
@@ -877,7 +1072,6 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
         import matplotlib.pyplot as plt
         import torchvision.transforms.functional as F
         import torchvision
-        import torch
 
         plt.rcParams["savefig.bbox"] = "tight"
 
@@ -892,15 +1086,20 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False, ood_eval
                 axs[0, i].set(xticklabels=[], yticklabels=[], xticks=[], yticks=[])
                 # fix.colorbar(im, ax=axs[0, i])
 
-        for x in train_ds:
+        for x in eval_ds:
             print("Shape:", x["image"].shape)
             print(x["image"].numpy().min(), x["image"].numpy().max())
-            xt = torch.from_numpy(x["image"].numpy()[:32])
-            # # xt = torch.permute(xt, (0,3,1,2))
+            xt = torch.from_numpy(x["image"].numpy()[:16, ...])
+            sns.heatmap(xt[0, 0])
+            plt.savefig(f"imgs/BRAIN.png", dpi=200)
+            # xt = torch.permute(xt, (0, 3, 1, 2))
             xt = torchvision.utils.make_grid(xt, nrow=4)
             show(xt)
             name = config.data.ood_ds if ood_eval else config.data.dataset
-            plt.savefig(f"{name}-{config.data.select_channel}.png", dpi=200)
+            mask_tag = "-masked" if config.data.mask_marginals else ""
+            plt.savefig(
+                f"imgs/{name}-c{config.data.select_channel}{mask_tag}.png", dpi=200
+            )
             break
         exit()
 
