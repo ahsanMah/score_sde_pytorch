@@ -183,10 +183,10 @@ class EulerMaruyamaPredictor(Predictor):
     def __init__(self, sde, score_fn, probability_flow=False):
         super().__init__(sde, score_fn, probability_flow)
 
-    def update_fn(self, x, t, mask=None):
+    def update_fn(self, x, t):
         dt = -1.0 / self.rsde.N
         z = torch.randn_like(x)
-        drift, diffusion = self.rsde.sde(x, t, mask)
+        drift, diffusion = self.rsde.sde(x, t)
         x_mean = x + drift * dt
         x = x_mean + diffusion[:, None, None, None] * np.sqrt(-dt) * z
         return x, x_mean
@@ -356,7 +356,7 @@ class NoneCorrector(Corrector):
 
 
 def shared_predictor_update_fn(
-    x, t, sde, model, predictor, probability_flow, continuous, mask=None
+    x, t, sde, model, predictor, probability_flow, continuous
 ):
     """A wrapper that configures and returns the update function of predictors."""
     score_fn = mutils.get_score_fn(sde, model, train=False, continuous=continuous)
@@ -365,7 +365,7 @@ def shared_predictor_update_fn(
         predictor_obj = NonePredictor(sde, score_fn, probability_flow)
     else:
         predictor_obj = predictor(sde, score_fn, probability_flow)
-    return predictor_obj.update_fn(x, t, mask)
+    return predictor_obj.update_fn(x, t)
 
 
 def shared_corrector_update_fn(x, t, sde, model, corrector, continuous, snr, n_steps):
@@ -459,7 +459,7 @@ def get_pc_sampler(
                 #     x = torch.concat([x, mask], axis=1)
                 # print("After corrector:", x.shape)
 
-                x, x_mean = predictor_update_fn(x, vec_t, model=model, mask=None)
+                x, x_mean = predictor_update_fn(x, vec_t, model=model)
                 # print("After Predictor:", x.shape)
 
                 if masked_marginals:

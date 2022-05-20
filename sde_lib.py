@@ -10,9 +10,9 @@ class SDE(abc.ABC):
     def __init__(self, N):
         """Construct an SDE.
 
-    Args:
-      N: number of discretization time steps.
-    """
+        Args:
+          N: number of discretization time steps.
+        """
         super().__init__()
         self.N = N
 
@@ -40,28 +40,28 @@ class SDE(abc.ABC):
     def prior_logp(self, z):
         """Compute log-density of the prior distribution.
 
-    Useful for computing the log-likelihood via probability flow ODE.
+        Useful for computing the log-likelihood via probability flow ODE.
 
-    Args:
-      z: latent code
-    Returns:
-      log probability density
-    """
+        Args:
+          z: latent code
+        Returns:
+          log probability density
+        """
         pass
 
     def discretize(self, x, t):
         """Discretize the SDE in the form: x_{i+1} = x_i + f_i(x_i) + G_i z_i.
 
-    Useful for reverse diffusion sampling and probabiliy flow sampling.
-    Defaults to Euler-Maruyama discretization.
+        Useful for reverse diffusion sampling and probabiliy flow sampling.
+        Defaults to Euler-Maruyama discretization.
 
-    Args:
-      x: a torch tensor
-      t: a torch float representing the time step (from 0 to `self.T`)
+        Args:
+          x: a torch tensor
+          t: a torch float representing the time step (from 0 to `self.T`)
 
-    Returns:
-      f, G
-    """
+        Returns:
+          f, G
+        """
         dt = 1 / self.N
         drift, diffusion = self.sde(x, t)
         f = drift * dt
@@ -71,10 +71,10 @@ class SDE(abc.ABC):
     def reverse(self, score_fn, probability_flow=False):
         """Create the reverse-time SDE/ODE.
 
-    Args:
-      score_fn: A time-dependent score-based model that takes x and t and returns the score.
-      probability_flow: If `True`, create the reverse-time ODE used for probability flow sampling.
-    """
+        Args:
+          score_fn: A time-dependent score-based model that takes x and t and returns the score.
+          probability_flow: If `True`, create the reverse-time ODE used for probability flow sampling.
+        """
         N = self.N
         T = self.T
         sde_fn = self.sde
@@ -117,11 +117,11 @@ class VPSDE(SDE):
     def __init__(self, beta_min=0.1, beta_max=20, N=1000):
         """Construct a Variance Preserving SDE.
 
-    Args:
-      beta_min: value of beta(0)
-      beta_max: value of beta(1)
-      N: number of discretization steps
-    """
+        Args:
+          beta_min: value of beta(0)
+          beta_max: value of beta(1)
+          N: number of discretization steps
+        """
         super().__init__(N)
         self.beta_0 = beta_min
         self.beta_1 = beta_max
@@ -144,7 +144,7 @@ class VPSDE(SDE):
 
     def marginal_prob(self, x, t):
         log_mean_coeff = (
-            -0.25 * t ** 2 * (self.beta_1 - self.beta_0) - 0.5 * t * self.beta_0
+            -0.25 * t**2 * (self.beta_1 - self.beta_0) - 0.5 * t * self.beta_0
         )
         mean = torch.exp(log_mean_coeff[:, None, None, None]) * x
         std = torch.sqrt(1.0 - torch.exp(2.0 * log_mean_coeff))
@@ -156,7 +156,7 @@ class VPSDE(SDE):
     def prior_logp(self, z):
         shape = z.shape
         N = np.prod(shape[1:])
-        logps = -N / 2.0 * np.log(2 * np.pi) - torch.sum(z ** 2, dim=(1, 2, 3)) / 2.0
+        logps = -N / 2.0 * np.log(2 * np.pi) - torch.sum(z**2, dim=(1, 2, 3)) / 2.0
         return logps
 
     def discretize(self, x, t):
@@ -174,11 +174,11 @@ class subVPSDE(SDE):
     def __init__(self, beta_min=0.1, beta_max=20, N=1000):
         """Construct the sub-VP SDE that excels at likelihoods.
 
-    Args:
-      beta_min: value of beta(0)
-      beta_max: value of beta(1)
-      N: number of discretization steps
-    """
+        Args:
+          beta_min: value of beta(0)
+          beta_max: value of beta(1)
+          N: number of discretization steps
+        """
         super().__init__(N)
         self.beta_0 = beta_min
         self.beta_1 = beta_max
@@ -192,14 +192,14 @@ class subVPSDE(SDE):
         beta_t = self.beta_0 + t * (self.beta_1 - self.beta_0)
         drift = -0.5 * beta_t[:, None, None, None] * x
         discount = 1.0 - torch.exp(
-            -2 * self.beta_0 * t - (self.beta_1 - self.beta_0) * t ** 2
+            -2 * self.beta_0 * t - (self.beta_1 - self.beta_0) * t**2
         )
         diffusion = torch.sqrt(beta_t * discount)
         return drift, diffusion
 
     def marginal_prob(self, x, t):
         log_mean_coeff = (
-            -0.25 * t ** 2 * (self.beta_1 - self.beta_0) - 0.5 * t * self.beta_0
+            -0.25 * t**2 * (self.beta_1 - self.beta_0) - 0.5 * t * self.beta_0
         )
         mean = torch.exp(log_mean_coeff)[:, None, None, None] * x
         std = 1 - torch.exp(2.0 * log_mean_coeff)
@@ -211,18 +211,18 @@ class subVPSDE(SDE):
     def prior_logp(self, z):
         shape = z.shape
         N = np.prod(shape[1:])
-        return -N / 2.0 * np.log(2 * np.pi) - torch.sum(z ** 2, dim=(1, 2, 3)) / 2.0
+        return -N / 2.0 * np.log(2 * np.pi) - torch.sum(z**2, dim=(1, 2, 3)) / 2.0
 
     def noise_schedule_inverse(self, sigma):
         """
         Returns the timepoint at which the sigma is observed
         according to the subVPSDE schedule
-        This is simply the solution obtained via the quadratic formula for the 
+        This is simply the solution obtained via the quadratic formula for the
         std calculation for a subVPSDE (b24ac => b^2 - 4ac)
         """
         b = self.beta_0
-        b24ac = b ** 2 - 2 * (self.beta_1 - self.beta_0) * torch.log(1 - sigma + 1e-12)
-        t = (-b + b24ac ** 0.5) / (self.beta_1 - self.beta_0)
+        b24ac = b**2 - 2 * (self.beta_1 - self.beta_0) * torch.log(1 - sigma + 1e-12)
+        t = (-b + b24ac**0.5) / (self.beta_1 - self.beta_0)
         return torch.clip(t, max=1.0)
 
 
@@ -230,11 +230,11 @@ class VESDE(SDE):
     def __init__(self, sigma_min=0.01, sigma_max=50, N=1000):
         """Construct a Variance Exploding SDE.
 
-    Args:
-      sigma_min: smallest sigma.
-      sigma_max: largest sigma.
-      N: number of discretization steps
-    """
+        Args:
+          sigma_min: smallest sigma.
+          sigma_max: largest sigma.
+          N: number of discretization steps
+        """
         super().__init__(N)
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
@@ -268,9 +268,9 @@ class VESDE(SDE):
     def prior_logp(self, z):
         shape = z.shape
         N = np.prod(shape[1:])
-        return -N / 2.0 * np.log(2 * np.pi * self.sigma_max ** 2) - torch.sum(
-            z ** 2, dim=(1, 2, 3)
-        ) / (2 * self.sigma_max ** 2)
+        return -N / 2.0 * np.log(2 * np.pi * self.sigma_max**2) - torch.sum(
+            z**2, dim=(1, 2, 3)
+        ) / (2 * self.sigma_max**2)
 
     def discretize(self, x, t):
         """SMLD(NCSN) discretization."""
@@ -282,6 +282,35 @@ class VESDE(SDE):
             self.discrete_sigmas[timestep - 1].to(t.device),
         )
         f = torch.zeros_like(x)
-        G = torch.sqrt(sigma ** 2 - adjacent_sigma ** 2)
+        G = torch.sqrt(sigma**2 - adjacent_sigma**2)
         return f, G
 
+
+def setup_sde(config):
+
+    # Setup SDEs
+    if config.training.sde.lower() == "vpsde":
+        sde = VPSDE(
+            beta_min=config.model.beta_min,
+            beta_max=config.model.beta_max,
+            N=config.model.num_scales,
+        )
+        sampling_eps = 1e-3
+    elif config.training.sde.lower() == "subvpsde":
+        sde = subVPSDE(
+            beta_min=config.model.beta_min,
+            beta_max=config.model.beta_max,
+            N=config.model.num_scales,
+        )
+        sampling_eps = 1e-3
+    elif config.training.sde.lower() == "vesde":
+        sde = VESDE(
+            sigma_min=config.model.sigma_min,
+            sigma_max=config.model.sigma_max,
+            N=config.model.num_scales,
+        )
+        sampling_eps = 1e-5
+    else:
+        raise NotImplementedError(f"SDE {config.training.sde} unknown.")
+
+    return sde, sampling_eps
