@@ -25,6 +25,7 @@ def get_config():
     training.sde = "subvpsde"
     training.continuous = True
     training.reduce_mean = True
+    training.batch_size = 16
 
     # sampling
     sampling = config.sampling
@@ -44,19 +45,19 @@ def get_config():
     model.scale_by_sigma = False
     model.ema_rate = 0.9999
     model.normalization = "GroupNorm"
-    model.nonlinearity = "swish"
-    model.nf = 64
+    model.nonlinearity = "mish"
+    model.nf = 128
     model.ch_mult = (1, 2, 2, 2)
-    model.num_res_blocks = 4
+    model.num_res_blocks = 8
     model.attn_resolutions = (16,)
     model.resamp_with_conv = True
     model.conditional = True
-    model.fir = True
+    model.fir = False
     model.fir_kernel = [1, 3, 3, 1]
     model.skip_rescale = True
     model.resblock_type = "biggan"
     model.progressive = "none"
-    model.progressive_input = "residual"
+    model.progressive_input = "none"
     model.progressive_combine = "sum"
     model.attention_type = "ddpm"
     model.embedding_type = "positional"

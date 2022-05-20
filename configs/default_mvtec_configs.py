@@ -8,7 +8,7 @@ def get_default_configs():
     config.training = training = ml_collections.ConfigDict()
     config.training.batch_size = 32
     training.n_iters = 2400001
-    training.snapshot_freq = 10000
+    training.snapshot_freq = 10001
     training.log_freq = 50
     training.eval_freq = 100
     ## store additional checkpoints for preemption in cloud computing environments
@@ -18,6 +18,7 @@ def get_default_configs():
     training.likelihood_weighting = False
     training.continuous = True
     training.reduce_mean = False
+    training.rand_augment = True
 
     # sampling
     config.sampling = sampling = ml_collections.ConfigDict()
@@ -40,8 +41,9 @@ def get_default_configs():
 
     # msma
     config.msma = msma = ml_collections.ConfigDict()
-    msma.min_timestep = 0.1  # Ignore first 10% of sigmas
+    msma.min_sigma = 1e-1  # Ignore first 10% of sigmas
     msma.n_timesteps = 100  # Number of discrete timesteps to evaluate
+    msma.checkpoint = -1
 
     # data
     config.data = data = ml_collections.ConfigDict()
@@ -53,6 +55,9 @@ def get_default_configs():
     data.centered = False
     data.num_channels = 3
     data.dir_path = "/DATA/Users/amahmood/GDrive/MVTec_AD/"
+    data.mask_marginals = False
+    data.dry_run = False
+    data.select_channel = -1
 
     # model
     config.model = model = ml_collections.ConfigDict()

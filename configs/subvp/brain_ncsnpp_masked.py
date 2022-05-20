@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # Lint as: python3
-"""Training NCSN++ on CIFAR-10 with sub-VP SDE."""
+"""Training NCSN++ on Brains with sub-VP SDE."""
 from configs.default_brain_configs import get_default_configs
 
 
@@ -35,8 +35,9 @@ def get_config():
     # data
     data = config.data
     data.centered = True
-    data.num_channels = 1
     data.select_channel = 1
+    data.num_channels = 2
+    data.mask_marginals = True
 
     # model
     model = config.model
