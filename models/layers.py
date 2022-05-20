@@ -37,6 +37,8 @@ def get_act(config):
         return nn.LeakyReLU(negative_slope=0.2)
     elif config.model.nonlinearity.lower() == "swish":
         return nn.SiLU()
+    elif config.model.nonlinearity.lower() == "mish":
+        return nn.Mish()
     else:
         raise NotImplementedError("activation function does not exist!")
 

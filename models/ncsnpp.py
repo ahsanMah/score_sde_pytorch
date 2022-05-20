@@ -160,12 +160,13 @@ class NCSNpp(nn.Module):
             raise ValueError(f"resblock type {resblock_type} unrecognized.")
 
         self.mask_output = None
-        channels = config.data.num_channels
+        input_channels = out_channels = config.data.num_channels
 
         if "mask_marginals" in config.data and config.data.mask_marginals:
+            out_channels -= 1
 
             def _fn(x, h):
-                _, mask = torch.split(x, (channels - 1, 1), dim=1)
+                _, mask = torch.split(x, (input_channels - 1, 1), dim=1)
                 return h * mask
 
             self.mask_output = _fn
@@ -173,9 +174,9 @@ class NCSNpp(nn.Module):
         # Downsampling block
 
         if progressive_input != "none":
-            input_pyramid_ch = channels
+            input_pyramid_ch = input_channels
 
-        modules.append(conv3x3(channels, nf))
+        modules.append(conv3x3(input_channels, nf))
         hs_c = [nf]
 
         in_ch = nf
@@ -235,8 +236,10 @@ class NCSNpp(nn.Module):
                                 eps=1e-6,
                             )
                         )
-                        modules.append(conv3x3(in_ch, channels, init_scale=init_scale))
-                        pyramid_ch = channels
+                        modules.append(
+                            conv3x3(in_ch, out_channels, init_scale=init_scale)
+                        )
+                        pyramid_ch = out_channels
                     elif progressive == "residual":
                         modules.append(
                             nn.GroupNorm(
@@ -259,9 +262,11 @@ class NCSNpp(nn.Module):
                             )
                         )
                         modules.append(
-                            conv3x3(in_ch, channels, bias=True, init_scale=init_scale)
+                            conv3x3(
+                                in_ch, out_channels, bias=True, init_scale=init_scale
+                            )
                         )
-                        pyramid_ch = channels
+                        pyramid_ch = out_channels
                     elif progressive == "residual":
                         modules.append(pyramid_upsample(in_ch=pyramid_ch, out_ch=in_ch))
                         pyramid_ch = in_ch
@@ -282,14 +287,14 @@ class NCSNpp(nn.Module):
                     num_groups=min(in_ch // 4, 32), num_channels=in_ch, eps=1e-6
                 )
             )
-            modules.append(conv3x3(in_ch, channels, init_scale=init_scale))
+            modules.append(conv3x3(in_ch, out_channels, init_scale=init_scale))
 
-        # If input was mask conditioned,
-        # we reduce the number of channels to image channels only
-        if self.mask_output:
-            modules.append(
-                conv1x1(channels, channels - 1, bias=True, init_scale=init_scale)
-            )
+        # # If input was mask conditioned,
+        # # we reduce the number of channels to image channels only
+        # if self.mask_output:
+        #     modules.append(
+        #         conv1x1(channels, channels - 1, bias=True, init_scale=init_scale)
+        #     )
 
         self.all_modules = nn.ModuleList(modules)
 
@@ -438,9 +443,9 @@ class NCSNpp(nn.Module):
             m_idx += 1
 
         if self.mask_output:
-            h = modules[m_idx](h)
+            # h = modules[m_idx](h)
             h = self.mask_output(x, h)
-            m_idx += 1
+            # m_idx += 1
 
         assert m_idx == len(modules)
 
